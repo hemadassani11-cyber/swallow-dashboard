@@ -2119,25 +2119,29 @@ function AlertLog({ nudges }) {
 
 // ============================================================
 // LIVE DEVICE TELEMETRY HOOK
-// Polls /api/telemetry on Vercel (same origin). UNO Q pushes state
-// to that endpoint every second, so dashboard shows live data
-// without needing to reach the device directly.
+// Polls /api/telemetry on Vercel (same origin) at 5Hz. UNO Q pushes
+// state to that endpoint every 200ms. Also maintains a rolling history
+// of the last 30 seconds of samples for the Live Monitor charts.
 // ============================================================
 
 const TELEMETRY_API = '/api/telemetry';
+const POLL_INTERVAL_MS = 200;          // 5Hz polling
+const HISTORY_SIZE = 180;              // 180 × 200ms = 36s rolling window
 
 function useDeviceTelemetry() {
   const [connected, setConnected] = useState(false);
   const [telemetry, setTelemetry] = useState(null);
   const [stale, setStale] = useState(false);
   const [ageMs, setAgeMs] = useState(null);
+  const [history, setHistory] = useState([]);
+  const historyRef = useRef([]);
 
   useEffect(() => {
     let cancelled = false;
     const poll = async () => {
       try {
         const ctrl = new AbortController();
-        const timer = setTimeout(() => ctrl.abort(), 2000);
+        const timer = setTimeout(() => ctrl.abort(), 1000);
         const r = await fetch(TELEMETRY_API, { signal: ctrl.signal });
         clearTimeout(timer);
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
@@ -2145,10 +2149,18 @@ function useDeviceTelemetry() {
         if (cancelled) return;
 
         if (data.hasData) {
-          setTelemetry(data.telemetry);
+          const t = data.telemetry;
+          setTelemetry(t);
           setConnected(!data.stale);
           setStale(!!data.stale);
           setAgeMs(data.ageMs);
+
+          // Append to rolling history if connection is fresh
+          if (!data.stale) {
+            const sample = { ts: Date.now(), ...t };
+            historyRef.current = [...historyRef.current, sample].slice(-HISTORY_SIZE);
+            setHistory(historyRef.current);
+          }
         } else {
           setConnected(false);
           setStale(false);
@@ -2161,11 +2173,11 @@ function useDeviceTelemetry() {
       }
     };
     poll();
-    const id = setInterval(poll, 1000);
+    const id = setInterval(poll, POLL_INTERVAL_MS);
     return () => { cancelled = true; clearInterval(id); };
   }, []);
 
-  return { connected, telemetry, stale, ageMs };
+  return { connected, telemetry, stale, ageMs, history };
 }
 
 // Compact status chip shown at top-right of Overview when device connected
@@ -2350,11 +2362,686 @@ function SensorReading({ label, value, color, dimensionless }) {
 
 
 // ============================================================
+// LIVE MONITOR PAGE — in-depth real-time data visualization
+// ============================================================
+
+// Generic SVG multi-series line chart for time-series data
+function MultiLineChart({
+  history,
+  series,              // [{key, color, label}]
+  height = 200,
+  yMin = 0,
+  yMax = 1,
+  yTicks = [0, 0.25, 0.5, 0.75, 1],
+  formatY = (v) => v.toFixed(2),
+  title,
+  subtitle,
+  windowMs = 30000,
+}) {
+  const now = Date.now();
+  const W = 1000;  // SVG viewBox width
+  const PL = 44, PR = 14, PT = 8, PB = 24;
+  const innerW = W - PL - PR;
+  const innerH = height - PT - PB;
+
+  const xAt = (ts) => PL + ((ts - (now - windowMs)) / windowMs) * innerW;
+  const yAt = (v) => PT + innerH - ((v - yMin) / (yMax - yMin)) * innerH;
+
+  const recent = history.filter((s) => s.ts >= now - windowMs);
+
+  const makePath = (key) => {
+    if (recent.length === 0) return '';
+    let d = '';
+    recent.forEach((s, i) => {
+      const rawVal = key.split('.').reduce((o, k) => o?.[k], s);
+      const v = typeof rawVal === 'number' ? rawVal : 0;
+      const x = xAt(s.ts);
+      const y = yAt(Math.max(yMin, Math.min(yMax, v)));
+      d += `${i === 0 ? 'M' : 'L'}${x.toFixed(1)},${y.toFixed(1)} `;
+    });
+    return d;
+  };
+
+  return (
+    <div style={{
+      background: T.canvas,
+      borderRadius: '16px',
+      padding: '18px 22px',
+      border: `1px solid ${T.hairline}`,
+    }}>
+      {title && (
+        <div style={{
+          display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start',
+          marginBottom: '10px',
+        }}>
+          <div>
+            <div style={{ fontSize: '14px', fontWeight: 600, color: T.textDeep }}>
+              {title}
+            </div>
+            {subtitle && (
+              <div style={{ fontSize: '12px', color: T.textMuted, marginTop: '2px' }}>
+                {subtitle}
+              </div>
+            )}
+          </div>
+          <div style={{ display: 'flex', gap: '12px', flexWrap: 'wrap' }}>
+            {series.map((s) => (
+              <div key={s.key} style={{
+                display: 'flex', alignItems: 'center', gap: '6px',
+                fontSize: '11px', color: T.textBody,
+              }}>
+                <div style={{
+                  width: '10px', height: '3px', borderRadius: '2px',
+                  background: s.color,
+                }}/>
+                <span>{s.label}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      <svg viewBox={`0 0 ${W} ${height}`} width="100%" style={{ display: 'block' }}>
+        {/* Y gridlines + labels */}
+        {yTicks.map((v, i) => (
+          <g key={i}>
+            <line
+              x1={PL} x2={PL + innerW}
+              y1={yAt(v)} y2={yAt(v)}
+              stroke={T.hairlineSoft} strokeWidth="1"
+            />
+            <text
+              x={PL - 8} y={yAt(v) + 4}
+              textAnchor="end" fontSize="10" fill={T.textMuted}
+              fontFamily="ui-monospace, Consolas, monospace"
+            >
+              {formatY(v)}
+            </text>
+          </g>
+        ))}
+        {/* X-axis baseline */}
+        <line
+          x1={PL} x2={PL + innerW}
+          y1={PT + innerH} y2={PT + innerH}
+          stroke={T.hairline} strokeWidth="1"
+        />
+        {/* Time labels */}
+        <text x={PL} y={height - 6} fontSize="10" fill={T.textMuted}
+              fontFamily="ui-monospace, Consolas, monospace">
+          -{Math.round(windowMs/1000)}s
+        </text>
+        <text x={PL + innerW} y={height - 6} textAnchor="end" fontSize="10" fill={T.textMuted}
+              fontFamily="ui-monospace, Consolas, monospace">
+          now
+        </text>
+        {/* Data lines */}
+        {series.map((s) => (
+          <path
+            key={s.key}
+            d={makePath(s.key)}
+            fill="none"
+            stroke={s.color}
+            strokeWidth="2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            vectorEffect="non-scaling-stroke"
+          />
+        ))}
+      </svg>
+    </div>
+  );
+}
+
+// Big current-classification gauge
+function ClassificationGauge({ telemetry }) {
+  const probs = telemetry?.probs || {};
+  const classes = ['swallow', 'idle', 'cough', 'speech'];
+  const colors = {
+    swallow: T.tealPrimary, idle: T.textMuted,
+    cough: T.coral, speech: T.amber,
+  };
+  const top = classes.reduce((a, b) => (probs[b] || 0) > (probs[a] || 0) ? b : a, 'idle');
+  const conf = probs[top] || 0;
+
+  // Arc gauge
+  const size = 160;
+  const radius = 64;
+  const cx = size / 2, cy = size / 2;
+  const arcLen = Math.PI * radius;  // half circle
+  const filled = arcLen * conf;
+
+  return (
+    <div style={{
+      background: T.canvas, borderRadius: '16px', padding: '22px',
+      border: `1px solid ${T.hairline}`,
+      display: 'flex', flexDirection: 'column', alignItems: 'center',
+    }}>
+      <div style={{
+        fontSize: '11px', fontWeight: 700, color: T.textMuted,
+        letterSpacing: '0.1em', textTransform: 'uppercase',
+        marginBottom: '10px',
+      }}>
+        Current classification
+      </div>
+      <svg width={size} height={size * 0.65} viewBox={`0 0 ${size} ${size * 0.65}`}>
+        {/* Background arc */}
+        <path
+          d={`M ${cx - radius} ${cy} A ${radius} ${radius} 0 0 1 ${cx + radius} ${cy}`}
+          fill="none" stroke={T.hairlineSoft} strokeWidth="10" strokeLinecap="round"
+        />
+        {/* Filled arc */}
+        <path
+          d={`M ${cx - radius} ${cy} A ${radius} ${radius} 0 0 1 ${cx + radius} ${cy}`}
+          fill="none" stroke={colors[top]} strokeWidth="10" strokeLinecap="round"
+          strokeDasharray={`${filled} ${arcLen}`}
+          style={{ transition: 'stroke-dasharray 0.3s ease-out, stroke 0.5s' }}
+        />
+        {/* Center text */}
+        <text x={cx} y={cy - 8} textAnchor="middle" fontSize="13"
+              fontWeight="700" fill={colors[top]}
+              style={{ textTransform: 'capitalize' }}>
+          {top}
+        </text>
+        <text x={cx} y={cy + 10} textAnchor="middle" fontSize="22"
+              fontWeight="800" fill={T.textDeep}
+              fontFamily="ui-monospace, Consolas, monospace">
+          {(conf * 100).toFixed(0)}%
+        </text>
+      </svg>
+      <div style={{ marginTop: '12px', width: '100%' }}>
+        {classes.map((cls) => (
+          <div key={cls} style={{
+            display: 'grid',
+            gridTemplateColumns: '56px 1fr 36px',
+            alignItems: 'center',
+            gap: '8px',
+            padding: '3px 0',
+          }}>
+            <span style={{
+              fontSize: '11px', color: colors[cls], fontWeight: 600,
+              textTransform: 'capitalize',
+            }}>
+              {cls}
+            </span>
+            <div style={{
+              height: '5px', background: T.hairlineSoft, borderRadius: '999px',
+              overflow: 'hidden',
+            }}>
+              <div style={{
+                height: '100%',
+                width: `${Math.max((probs[cls] || 0) * 100, 2)}%`,
+                background: colors[cls],
+                transition: 'width 0.3s ease-out',
+              }}/>
+            </div>
+            <span style={{
+              fontSize: '10px', color: T.textMuted,
+              fontFamily: 'ui-monospace, Consolas, monospace',
+              textAlign: 'right',
+            }}>
+              {((probs[cls] || 0) * 100).toFixed(0)}
+            </span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// Idle countdown + next tier ETA
+function IdleCountdownCard({ telemetry, thresholds }) {
+  if (!telemetry) return null;
+  const idle = telemetry.idle_s || 0;
+  const level = telemetry.alert_level || 0;
+  const tierNames = ['Normal', 'Watch', 'Attention', 'Urgent', 'SOS'];
+  const tierColors = [T.success, T.amber, T.tier2, T.tier3, T.tier4];
+
+  const nextThresh =
+    idle < thresholds.tier1 ? thresholds.tier1 :
+    idle < thresholds.tier2 ? thresholds.tier2 :
+    idle < thresholds.tier3 ? thresholds.tier3 :
+    idle < thresholds.tier4 ? thresholds.tier4 : null;
+  const nextTierIdx = Math.min(level + 1, 4);
+  const toNext = nextThresh ? Math.max(0, nextThresh - idle) : 0;
+
+  return (
+    <div style={{
+      background: T.canvas, borderRadius: '16px', padding: '22px',
+      border: `1px solid ${T.hairline}`,
+      display: 'flex', flexDirection: 'column', justifyContent: 'space-between',
+    }}>
+      <div style={{
+        fontSize: '11px', fontWeight: 700, color: T.textMuted,
+        letterSpacing: '0.1em', textTransform: 'uppercase', marginBottom: '8px',
+      }}>
+        Idle countdown
+      </div>
+      <div style={{
+        fontSize: '56px', fontWeight: 800, color: tierColors[level],
+        lineHeight: 1, letterSpacing: '-2px',
+        fontFamily: 'ui-monospace, Consolas, monospace',
+      }}>
+        {idle}<span style={{ fontSize: '22px', opacity: 0.6, marginLeft: '4px' }}>s</span>
+      </div>
+      <div style={{
+        marginTop: '6px', fontSize: '14px', fontWeight: 700,
+        color: tierColors[level],
+      }}>
+        Tier {level} · {tierNames[level]}
+      </div>
+      {nextThresh && (
+        <div style={{
+          marginTop: '14px',
+          padding: '10px 12px', borderRadius: '8px',
+          background: T.tealTint,
+          fontSize: '12px', color: T.textBody,
+        }}>
+          <div style={{ color: T.textMuted, fontSize: '10px', fontWeight: 600, letterSpacing: '0.08em', textTransform: 'uppercase' }}>
+            Next escalation
+          </div>
+          <div style={{
+            marginTop: '2px', fontVariantNumeric: 'tabular-nums',
+            fontWeight: 600, color: T.textDeep,
+          }}>
+            Tier {nextTierIdx} in <span style={{ color: tierColors[nextTierIdx] }}>{toNext}s</span>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Status indicators card
+function SystemHealthCard({ telemetry, connected, stale }) {
+  if (!telemetry) {
+    return (
+      <div style={{
+        background: T.canvas, borderRadius: '16px', padding: '22px',
+        border: `1px solid ${T.hairline}`,
+      }}>
+        <div style={{ fontSize: '11px', fontWeight: 700, color: T.textMuted,
+          letterSpacing: '0.1em', textTransform: 'uppercase', marginBottom: '14px' }}>
+          System health
+        </div>
+        <div style={{ fontSize: '12px', color: T.textFaint }}>
+          No telemetry yet. Waiting for UNO Q to connect...
+        </div>
+      </div>
+    );
+  }
+
+  const mpuStatus = telemetry.mpu_status || 0;
+  const throatOK = (mpuStatus & 1) > 0;
+  const sternumOK = (mpuStatus & 2) > 0;
+  const modelOK = !!telemetry.model_loaded;
+
+  const Row = ({ label, ok, detail }) => (
+    <div style={{
+      display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+      padding: '8px 0', borderBottom: `1px solid ${T.hairlineSoft}`,
+    }}>
+      <span style={{ fontSize: '12px', color: T.textBody }}>{label}</span>
+      <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+        <span style={{ fontSize: '11px', color: T.textMuted }}>{detail}</span>
+        <div style={{
+          width: '8px', height: '8px', borderRadius: '50%',
+          background: ok ? T.success : T.coral,
+          boxShadow: ok ? `0 0 0 3px ${T.success}25` : 'none',
+        }}/>
+      </div>
+    </div>
+  );
+
+  return (
+    <div style={{
+      background: T.canvas, borderRadius: '16px', padding: '22px',
+      border: `1px solid ${T.hairline}`,
+    }}>
+      <div style={{ fontSize: '11px', fontWeight: 700, color: T.textMuted,
+        letterSpacing: '0.1em', textTransform: 'uppercase', marginBottom: '10px' }}>
+        System health
+      </div>
+      <Row label="Network link" ok={connected && !stale}
+           detail={connected ? 'live' : stale ? 'stale' : 'offline'} />
+      <Row label="Throat MPU (0x68)" ok={throatOK}
+           detail={throatOK ? 'streaming' : 'no data'} />
+      <Row label="Sternum MPU (0x69)" ok={sternumOK}
+           detail={sternumOK ? 'streaming' : 'no data'} />
+      <Row label="Edge Impulse model" ok={modelOK}
+           detail={modelOK ? 'loaded' : 'not ready'} />
+      <div style={{
+        marginTop: '12px', fontSize: '11px', color: T.textMuted,
+        fontFamily: 'ui-monospace, Consolas, monospace',
+      }}>
+        Uptime: {Math.floor((telemetry.uptime_s || 0) / 60)}m{(telemetry.uptime_s || 0) % 60}s
+        · {telemetry.swallow_count || 0} swallows
+      </div>
+    </div>
+  );
+}
+
+// Live event stream — derives events from history
+function LiveEventStream({ history, maxEvents = 15 }) {
+  const eventsRef = useRef([]);
+  const lastLevelRef = useRef(0);
+  const lastCountRef = useRef(null);
+
+  useEffect(() => {
+    if (history.length === 0) return;
+    const latest = history[history.length - 1];
+    const now = latest.ts;
+
+    // Detect tier change
+    const currLevel = latest.alert_level || 0;
+    if (currLevel !== lastLevelRef.current) {
+      if (currLevel > lastLevelRef.current) {
+        eventsRef.current.unshift({
+          id: `tier-${now}`, ts: now,
+          type: 'alert',
+          text: `Tier ${currLevel} alert fired`,
+        });
+      } else if (currLevel === 0) {
+        eventsRef.current.unshift({
+          id: `rec-${now}`, ts: now,
+          type: 'recovery',
+          text: 'Alert cleared — swallow detected',
+        });
+      }
+      lastLevelRef.current = currLevel;
+    }
+
+    // Detect swallow (count increment)
+    const currCount = latest.swallow_count;
+    if (lastCountRef.current !== null && currCount > lastCountRef.current) {
+      const p = latest.probs?.swallow || 0;
+      eventsRef.current.unshift({
+        id: `sw-${now}`, ts: now,
+        type: 'swallow',
+        text: `Swallow detected (p=${p.toFixed(2)})`,
+      });
+    }
+    lastCountRef.current = currCount;
+
+    // Trim
+    eventsRef.current = eventsRef.current.slice(0, maxEvents);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [history]);
+
+  const events = eventsRef.current;
+  const typeStyle = {
+    alert:    { color: T.coral, bg: T.coralWash,    badge: 'ALERT' },
+    recovery: { color: T.success, bg: T.successWash,badge: 'RECOVERY' },
+    swallow:  { color: T.tealPrimary, bg: T.tealWash,badge: 'SWALLOW' },
+  };
+
+  const fmtAgo = (ts) => {
+    const s = Math.round((Date.now() - ts) / 1000);
+    if (s < 60) return `${s}s ago`;
+    return `${Math.floor(s / 60)}m ${s % 60}s ago`;
+  };
+
+  return (
+    <div style={{
+      background: T.canvas, borderRadius: '16px',
+      border: `1px solid ${T.hairline}`,
+      overflow: 'hidden',
+    }}>
+      <div style={{
+        padding: '18px 22px 14px',
+        borderBottom: `1px solid ${T.hairlineSoft}`,
+        display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+      }}>
+        <div>
+          <div style={{ fontSize: '14px', fontWeight: 600, color: T.textDeep }}>
+            Live event stream
+          </div>
+          <div style={{ fontSize: '11px', color: T.textMuted, marginTop: '2px' }}>
+            Derived from UNO Q telemetry · rolling 36s window
+          </div>
+        </div>
+        <div style={{ fontSize: '11px', color: T.textFaint }}>
+          {events.length} events
+        </div>
+      </div>
+      <div style={{ maxHeight: '280px', overflowY: 'auto' }}>
+        {events.length === 0 && (
+          <div style={{
+            padding: '32px 22px', textAlign: 'center',
+            color: T.textFaint, fontSize: '12px',
+          }}>
+            Monitoring... events appear here as they happen.
+          </div>
+        )}
+        {events.map((e) => {
+          const s = typeStyle[e.type];
+          return (
+            <div key={e.id} style={{
+              padding: '10px 22px',
+              display: 'grid',
+              gridTemplateColumns: '90px 1fr 80px',
+              gap: '12px',
+              alignItems: 'center',
+              borderBottom: `1px solid ${T.hairlineSoft}`,
+              fontSize: '12px',
+            }}>
+              <span style={{
+                fontSize: '10px', fontWeight: 700, letterSpacing: '0.08em',
+                padding: '3px 8px', borderRadius: '6px', textAlign: 'center',
+                background: s.bg, color: s.color,
+              }}>
+                {s.badge}
+              </span>
+              <span style={{ color: T.textDeep, fontWeight: 500 }}>
+                {e.text}
+              </span>
+              <span style={{
+                fontSize: '11px', color: T.textMuted,
+                fontFamily: 'ui-monospace, Consolas, monospace',
+                textAlign: 'right',
+              }}>
+                {fmtAgo(e.ts)}
+              </span>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function LiveMonitorPage({ thresholds }) {
+  const { connected, telemetry, history, stale } = useDeviceTelemetry();
+
+  // Auto-scale the accelerometer chart based on observed values
+  const maxRms = Math.max(
+    1.3,
+    ...history.map((s) => Math.max(s.throat_rms || 0, s.sternum_rms || 0))
+  );
+  const maxRatio = Math.max(
+    2.0,
+    ...history.map((s) => s.ratio || 0)
+  );
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
+      {/* Header */}
+      <div style={{
+        display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+        padding: '14px 20px',
+        background: T.canvas,
+        borderRadius: '14px', border: `1px solid ${T.hairline}`,
+      }}>
+        <div>
+          <div style={{ fontSize: '18px', fontWeight: 700, color: T.textDeep }}>
+            Live Monitor
+          </div>
+          <div style={{ fontSize: '12px', color: T.textMuted, marginTop: '2px' }}>
+            Real-time ML inference and biomechanical sensor data at 5&nbsp;Hz
+          </div>
+        </div>
+        <div style={{
+          display: 'inline-flex', alignItems: 'center', gap: '8px',
+          padding: '6px 12px', borderRadius: '999px',
+          background: connected ? T.successWash : stale ? T.amberWash : '#f4f4f5',
+          color: connected ? T.success : stale ? T.amber : T.textMuted,
+          border: `1px solid ${connected ? '#a7d9bf' : T.hairline}`,
+          fontSize: '12px', fontWeight: 700,
+          letterSpacing: '0.05em',
+        }}>
+          <span style={{
+            width: '8px', height: '8px', borderRadius: '50%',
+            background: 'currentColor',
+            boxShadow: connected ? `0 0 0 3px ${T.success}30` : 'none',
+          }}/>
+          {connected ? 'LIVE · 5 Hz' : stale ? 'STALE' : 'OFFLINE'}
+          <span style={{ color: T.textMuted, fontWeight: 500, marginLeft: '4px' }}>
+            · {history.length} samples buffered
+          </span>
+        </div>
+      </div>
+
+      {/* Row 1 — ML classification time series, full width */}
+      <MultiLineChart
+        history={history}
+        title="ML classification probabilities"
+        subtitle="Edge Impulse · 4-class spectral model · updates every 200ms"
+        height={220}
+        yMin={0} yMax={1}
+        yTicks={[0, 0.25, 0.5, 0.75, 1]}
+        formatY={(v) => v.toFixed(2)}
+        series={[
+          { key: 'probs.swallow', color: T.tealPrimary, label: 'swallow' },
+          { key: 'probs.idle',    color: T.textFaint,   label: 'idle' },
+          { key: 'probs.cough',   color: T.coral,       label: 'cough' },
+          { key: 'probs.speech',  color: T.amber,       label: 'speech' },
+        ]}
+      />
+
+      {/* Row 2 — Accelerometer + Ratio side by side */}
+      <div style={{
+        display: 'grid',
+        gridTemplateColumns: '1fr 1fr',
+        gap: '16px',
+      }}>
+        <MultiLineChart
+          history={history}
+          title="Accelerometer RMS (g)"
+          subtitle="Throat (MPU 0x68) and Sternum (MPU 0x69)"
+          height={180}
+          yMin={0} yMax={maxRms}
+          yTicks={[0, maxRms * 0.5, maxRms].map((v) => Number(v.toFixed(2)))}
+          formatY={(v) => v.toFixed(2)}
+          series={[
+            { key: 'throat_rms',  color: T.tealPrimary, label: 'throat' },
+            { key: 'sternum_rms', color: T.amber,       label: 'sternum' },
+          ]}
+        />
+        <MultiLineChart
+          history={history}
+          title="Throat / Sternum ratio"
+          subtitle="Signature biomarker — spikes during swallow events"
+          height={180}
+          yMin={0} yMax={maxRatio}
+          yTicks={[0, maxRatio * 0.5, maxRatio].map((v) => Number(v.toFixed(1)))}
+          formatY={(v) => v.toFixed(1)}
+          series={[
+            { key: 'ratio', color: T.tier2, label: 'ratio' },
+          ]}
+        />
+      </div>
+
+      {/* Row 3 — Classification gauge, idle countdown, system health */}
+      <div style={{
+        display: 'grid',
+        gridTemplateColumns: '1fr 1fr 1fr',
+        gap: '16px',
+      }}>
+        <ClassificationGauge telemetry={telemetry} />
+        <IdleCountdownCard telemetry={telemetry} thresholds={thresholds} />
+        <SystemHealthCard telemetry={telemetry} connected={connected} stale={stale} />
+      </div>
+
+      {/* Row 4 — Live event stream, full width */}
+      <LiveEventStream history={history} />
+    </div>
+  );
+}
+
+// ============================================================
 // OVERVIEW PAGE
 // ============================================================
 
 function OverviewPage({ thresholds }) {
   const { connected: deviceConnected, telemetry: deviceTelemetry, stale: deviceStale, ageMs: deviceAgeMs } = useDeviceTelemetry();
+
+  // ========== ChYme voice alerts (Gemini → ElevenLabs) ==========
+  const [voiceEnabled, setVoiceEnabled] = useState(false);
+  const [voiceStatus, setVoiceStatus] = useState('');
+  const [lastSpokenText, setLastSpokenText] = useState('');
+  const lastSpokenTierRef = useRef(0);
+  const playingRef = useRef(false);
+
+  const playVoiceAlert = async (tier, opts = {}) => {
+    const { testMode = false } = opts;
+    if (playingRef.current) return;
+    playingRef.current = true;
+    try {
+      setVoiceStatus(testMode ? 'Testing voice...' : `Speaking Tier ${tier} alert...`);
+      const res = await fetch('/api/voice-alert', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          tier,
+          patientName: 'Maria',
+          testMode,
+        }),
+      });
+      if (!res.ok) {
+        let err;
+        try { err = await res.json(); } catch { err = { error: `HTTP ${res.status}` }; }
+        setVoiceStatus(`Voice failed: ${err.error || 'unknown'}`);
+        setTimeout(() => setVoiceStatus(''), 4000);
+        return;
+      }
+      const message = decodeURIComponent(res.headers.get('X-Voice-Message') || '');
+      setLastSpokenText(message);
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const audio = new Audio(url);
+      await audio.play();
+      setVoiceStatus(`Speaking: "${message}"`);
+      audio.onended = () => {
+        URL.revokeObjectURL(url);
+        setTimeout(() => setVoiceStatus(''), 2000);
+      };
+    } catch (e) {
+      setVoiceStatus(`Audio error: ${e.message}`);
+      setTimeout(() => setVoiceStatus(''), 4000);
+    } finally {
+      playingRef.current = false;
+    }
+  };
+
+  const enableVoice = async () => {
+    // Browsers require a user gesture to unlock audio. We play a test message
+    // on click so future auto-triggered alerts work.
+    setVoiceEnabled(true);
+    await playVoiceAlert(1, { testMode: true });
+  };
+
+  // Auto-speak when tier escalates (only if voice enabled)
+  useEffect(() => {
+    if (!voiceEnabled || !deviceConnected || !deviceTelemetry) return;
+    const currentTier = deviceTelemetry.alert_level || 0;
+    if (currentTier > lastSpokenTierRef.current && currentTier >= 1) {
+      lastSpokenTierRef.current = currentTier;
+      playVoiceAlert(currentTier);
+    } else if (currentTier === 0) {
+      lastSpokenTierRef.current = 0;
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [deviceTelemetry?.alert_level, voiceEnabled, deviceConnected]);
+  // ============================================================
 
   const realLastSwallow = todaySwallows[todaySwallows.length - 1] || new Date();
   const [lastSwallowOverride, setLastSwallowOverride] = useState(null);
@@ -2401,8 +3088,50 @@ function OverviewPage({ thresholds }) {
       <div style={{
         marginBottom: '12px',
         display: 'flex',
-        justifyContent: 'flex-end',
+        justifyContent: 'space-between',
+        alignItems: 'center',
+        gap: '12px',
+        flexWrap: 'wrap',
       }}>
+        <div style={{
+          display: 'flex',
+          alignItems: 'center',
+          gap: '10px',
+          flexWrap: 'wrap',
+        }}>
+          <button
+            onClick={voiceEnabled ? () => setVoiceEnabled(false) : enableVoice}
+            style={{
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: '8px',
+              padding: '6px 14px',
+              borderRadius: '999px',
+              border: `1px solid ${voiceEnabled ? '#a7d9bf' : T.hairline}`,
+              background: voiceEnabled ? T.successWash : T.canvas,
+              color: voiceEnabled ? T.success : T.textBody,
+              fontSize: '12px',
+              fontWeight: 600,
+              cursor: 'pointer',
+              fontFamily: 'inherit',
+            }}
+          >
+            {voiceEnabled ? '🔊 Voice alerts ON' : '🔇 Enable voice alerts'}
+          </button>
+          {voiceStatus && (
+            <span style={{
+              fontSize: '12px',
+              color: T.textMuted,
+              fontStyle: 'italic',
+              maxWidth: '420px',
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+              whiteSpace: 'nowrap',
+            }}>
+              {voiceStatus}
+            </span>
+          )}
+        </div>
         <LiveDeviceBadge
           connected={deviceConnected}
           telemetry={deviceTelemetry}
@@ -3858,290 +4587,6 @@ function ReportsPage() {
       {downloadError && (
         <div style={{ fontSize: '13px', color: T.coral, textAlign: 'center' }}>{downloadError}</div>
       )}
-    </div>
-  );
-}
-
-// ============================================================
-// LIVE MONITOR PAGE
-// Real-time view wired to /api/telemetry (UNO Q relay).
-// Shows classification, sensor values, rolling sparkline history,
-// idle timer with tier escalation, and running swallow count.
-// ============================================================
-
-const HISTORY_LEN = 60; // seconds of rolling buffer
-
-function useTelemetryHistory(telemetry, connected) {
-  const [history, setHistory] = useState([]);
-  useEffect(() => {
-    if (!connected || !telemetry) return;
-    setHistory((prev) => {
-      const next = [...prev, {
-        t: Date.now(),
-        swallow: telemetry.probs?.swallow || 0,
-        idle:    telemetry.probs?.idle    || 0,
-        cough:   telemetry.probs?.cough   || 0,
-        speech:  telemetry.probs?.speech  || 0,
-        throat:  telemetry.throat_rms     || 0,
-        sternum: telemetry.sternum_rms    || 0,
-        idle_s:  telemetry.idle_s         || 0,
-      }];
-      return next.slice(-HISTORY_LEN);
-    });
-  }, [telemetry, connected]);
-  return history;
-}
-
-function Sparkline({ values, color, height = 42, max }) {
-  if (!values || values.length === 0) {
-    return <div style={{ height, background: T.hairlineSoft, borderRadius: '6px' }}/>;
-  }
-  const W = 100, H = height;
-  const m = max ?? Math.max(1, ...values);
-  const pts = values.map((v, i) => {
-    const x = (i / Math.max(values.length - 1, 1)) * W;
-    const y = H - (v / m) * H;
-    return `${x.toFixed(2)},${y.toFixed(2)}`;
-  }).join(' ');
-  const area = `0,${H} ${pts} ${W},${H}`;
-  return (
-    <svg viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none"
-         style={{ width: '100%', height, display: 'block' }}>
-      <polygon points={area} fill={color} opacity="0.12"/>
-      <polyline points={pts} fill="none" stroke={color} strokeWidth="1.5"
-                strokeLinejoin="round" strokeLinecap="round"/>
-    </svg>
-  );
-}
-
-function LiveMonitorPage({ thresholds }) {
-  const { connected, telemetry, stale, ageMs } = useDeviceTelemetry();
-  const history = useTelemetryHistory(telemetry, connected);
-
-  const idle_s = telemetry?.idle_s ?? 0;
-  const tier = idle_s >= thresholds.tier4 ? 4
-             : idle_s >= thresholds.tier3 ? 3
-             : idle_s >= thresholds.tier2 ? 2
-             : idle_s >= thresholds.tier1 ? 1 : 0;
-  const tierColor = tier >= 4 ? T.coral
-                 : tier >= 3 ? T.amber
-                 : tier >= 2 ? T.amber
-                 : tier >= 1 ? T.tealPrimary
-                 : T.success;
-  const tierLabel = ['Normal', 'Tier 1 · Notice', 'Tier 2 · Caution',
-                     'Tier 3 · Critical', 'Tier 4 · SOS'][tier];
-
-  const probs = telemetry?.probs || {};
-  const classes = ['swallow', 'idle', 'cough', 'speech'];
-  const classColors = {
-    swallow: T.tealPrimary,
-    idle:    T.textMuted,
-    cough:   T.coral,
-    speech:  T.amber,
-  };
-  const top = classes.reduce((a, b) => (probs[b] || 0) > (probs[a] || 0) ? b : a, 'idle');
-
-  return (
-    <div>
-      <div style={{
-        marginBottom: '16px',
-        display: 'flex',
-        justifyContent: 'space-between',
-        alignItems: 'center',
-      }}>
-        <div>
-          <div style={{
-            fontSize: '22px', fontWeight: 700, color: T.textDeep,
-            letterSpacing: '-0.01em',
-          }}>Live Monitor</div>
-          <div style={{ fontSize: '13px', color: T.textMuted, marginTop: '2px' }}>
-            Real-time stream from ChYme wearable · Edge Impulse model on UNO Q
-          </div>
-        </div>
-        <LiveDeviceBadge
-          connected={connected}
-          telemetry={telemetry}
-          stale={stale}
-          ageMs={ageMs}
-        />
-      </div>
-
-      {!connected && !stale && (
-        <div style={{
-          background: T.canvas,
-          border: `1px dashed ${T.hairline}`,
-          borderRadius: '16px',
-          padding: '56px 28px',
-          textAlign: 'center',
-        }}>
-          <div style={{
-            width: '64px', height: '64px', borderRadius: '16px',
-            background: T.tealWash, color: T.tealPrimary,
-            display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
-            marginBottom: '16px',
-          }}>
-            <div style={{ transform: 'scale(1.8)' }}>{icons.activity}</div>
-          </div>
-          <div style={{ fontSize: '17px', fontWeight: 700, color: T.textDeep }}>
-            Waiting for device
-          </div>
-          <div style={{
-            fontSize: '13px', color: T.textMuted, marginTop: '6px',
-            maxWidth: '440px', marginLeft: 'auto', marginRight: 'auto', lineHeight: 1.55,
-          }}>
-            Power on the ChYme UNO Q wearable. Once <code>main.py</code> starts posting to
-            <code> /api/telemetry</code>, live classification and sensor data will appear here.
-          </div>
-        </div>
-      )}
-
-      {(connected || stale) && telemetry && (
-        <>
-          {/* Top stats */}
-          <div style={{
-            display: 'grid',
-            gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))',
-            gap: '16px',
-            marginBottom: '16px',
-          }}>
-            <LiveStatCard
-              label="Idle since last swallow"
-              value={`${idle_s}s`}
-              accent={tierColor}
-              sub={tierLabel}
-            />
-            <LiveStatCard               label="Swallow count (session)"
-              value={String(telemetry.swallow_count ?? 0)}
-              accent={T.tealPrimary}
-              sub="Detected events"
-            />
-            <LiveStatCard               label="Top class"
-              value={top}
-              accent={classColors[top]}
-              sub={`${((probs[top] || 0) * 100).toFixed(0)}% confidence`}
-              valueTransform="capitalize"
-            />
-            <LiveStatCard               label="Update"
-              value={ageMs != null ? `${Math.round(ageMs / 1000)}s` : '—'}
-              accent={stale ? T.amber : T.success}
-              sub={stale ? 'Stale' : 'Live · 1 Hz'}
-            />
-          </div>
-
-          {/* Sensor panel */}
-          <LiveSensorPanel telemetry={telemetry}/>
-
-          {/* Sparklines */}
-          <div style={{
-            background: T.canvas,
-            borderRadius: '16px',
-            padding: '18px 22px',
-            border: `1px solid ${T.hairline}`,
-            marginBottom: '16px',
-          }}>
-            <div style={{
-              fontSize: '13px', fontWeight: 600, color: T.textDeep, marginBottom: '14px',
-            }}>
-              Last {history.length}s — class probabilities
-            </div>
-            <div style={{
-              display: 'grid',
-              gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))',
-              gap: '14px',
-            }}>
-              {classes.map((cls) => (
-                <div key={cls}>
-                  <div style={{
-                    display: 'flex', justifyContent: 'space-between',
-                    fontSize: '11px', fontWeight: 600,
-                    color: classColors[cls], textTransform: 'uppercase',
-                    letterSpacing: '0.08em', marginBottom: '6px',
-                  }}>
-                    <span>{cls}</span>
-                    <span style={{ color: T.textMuted, fontVariantNumeric: 'tabular-nums' }}>
-                      {((probs[cls] || 0) * 100).toFixed(0)}%
-                    </span>
-                  </div>
-                  <Sparkline
-                    values={history.map((h) => h[cls])}
-                    color={classColors[cls]}
-                    max={1}
-                  />
-                </div>
-              ))}
-            </div>
-          </div>
-
-          {/* Accelerometer history */}
-          <div style={{
-            background: T.canvas,
-            borderRadius: '16px',
-            padding: '18px 22px',
-            border: `1px solid ${T.hairline}`,
-          }}>
-            <div style={{
-              fontSize: '13px', fontWeight: 600, color: T.textDeep, marginBottom: '14px',
-            }}>
-              Accelerometer RMS — last {history.length}s
-            </div>
-            <div style={{
-              display: 'grid',
-              gridTemplateColumns: '1fr 1fr',
-              gap: '14px',
-            }}>
-              <div>
-                <div style={{
-                  fontSize: '11px', fontWeight: 600, color: T.tealPrimary,
-                  textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: '6px',
-                }}>
-                  Throat (g)
-                </div>
-                <Sparkline
-                  values={history.map((h) => h.throat)}
-                  color={T.tealPrimary}
-                />
-              </div>
-              <div>
-                <div style={{
-                  fontSize: '11px', fontWeight: 600, color: T.amber,
-                  textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: '6px',
-                }}>
-                  Sternum (g)
-                </div>
-                <Sparkline
-                  values={history.map((h) => h.sternum)}
-                  color={T.amber}
-                />
-              </div>
-            </div>
-          </div>
-        </>
-      )}
-    </div>
-  );
-}
-
-function LiveStatCard({ label, value, accent, sub, valueTransform }) {
-  return (
-    <div style={{
-      background: T.canvas,
-      borderRadius: '14px',
-      padding: '16px 18px',
-      border: `1px solid ${T.hairline}`,
-      borderLeft: `3px solid ${accent}`,
-    }}>
-      <div style={{
-        fontSize: '11px', fontWeight: 600, color: T.textMuted,
-        letterSpacing: '0.08em', textTransform: 'uppercase',
-      }}>{label}</div>
-      <div style={{
-        fontSize: '26px', fontWeight: 700, color: T.textDeep, marginTop: '6px',
-        fontVariantNumeric: 'tabular-nums',
-        textTransform: valueTransform || 'none',
-      }}>{value}</div>
-      <div style={{ fontSize: '12px', color: accent, fontWeight: 600, marginTop: '2px' }}>
-        {sub}
-      </div>
     </div>
   );
 }
