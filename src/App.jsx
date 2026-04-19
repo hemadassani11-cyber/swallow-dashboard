@@ -4004,27 +4004,24 @@ function LiveMonitorPage({ thresholds }) {
             gap: '16px',
             marginBottom: '16px',
           }}>
-            <StatCard
+            <LiveStatCard
               label="Idle since last swallow"
               value={`${idle_s}s`}
               accent={tierColor}
               sub={tierLabel}
             />
-            <StatCard
-              label="Swallow count (session)"
+            <LiveStatCard               label="Swallow count (session)"
               value={String(telemetry.swallow_count ?? 0)}
               accent={T.tealPrimary}
               sub="Detected events"
             />
-            <StatCard
-              label="Top class"
+            <LiveStatCard               label="Top class"
               value={top}
               accent={classColors[top]}
               sub={`${((probs[top] || 0) * 100).toFixed(0)}% confidence`}
               valueTransform="capitalize"
             />
-            <StatCard
-              label="Update"
+            <LiveStatCard               label="Update"
               value={ageMs != null ? `${Math.round(ageMs / 1000)}s` : '—'}
               accent={stale ? T.amber : T.success}
               sub={stale ? 'Stale' : 'Live · 1 Hz'}
@@ -4124,7 +4121,7 @@ function LiveMonitorPage({ thresholds }) {
   );
 }
 
-function StatCard({ label, value, accent, sub, valueTransform }) {
+function LiveStatCard({ label, value, accent, sub, valueTransform }) {
   return (
     <div style={{
       background: T.canvas,
