@@ -2119,52 +2119,72 @@ function AlertLog({ nudges }) {
 
 // ============================================================
 // LIVE DEVICE TELEMETRY HOOK
-// Polls the UNO Q HTTP /status endpoint on port 7000.
-// Returns { connected, telemetry } — telemetry shape matches main.py.
+// Polls /api/telemetry on Vercel (same origin). UNO Q pushes state
+// to that endpoint every second, so dashboard shows live data
+// without needing to reach the device directly.
 // ============================================================
 
-const DEFAULT_DEVICE_URL = 'http://172.20.10.2:7000/status';
-const DEVICE_URL_KEY = 'chyme.deviceUrl';
+const TELEMETRY_API = '/api/telemetry';
 
 function useDeviceTelemetry() {
-  const [deviceUrl] = useState(() => {
-    try { return localStorage.getItem(DEVICE_URL_KEY) || DEFAULT_DEVICE_URL; }
-    catch { return DEFAULT_DEVICE_URL; }
-  });
   const [connected, setConnected] = useState(false);
   const [telemetry, setTelemetry] = useState(null);
-  const [lastError, setLastError] = useState(null);
+  const [stale, setStale] = useState(false);
+  const [ageMs, setAgeMs] = useState(null);
 
   useEffect(() => {
     let cancelled = false;
     const poll = async () => {
       try {
         const ctrl = new AbortController();
-        const timer = setTimeout(() => ctrl.abort(), 1500);
-        const r = await fetch(deviceUrl, { signal: ctrl.signal });
+        const timer = setTimeout(() => ctrl.abort(), 2000);
+        const r = await fetch(TELEMETRY_API, { signal: ctrl.signal });
         clearTimeout(timer);
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
         const data = await r.json();
         if (cancelled) return;
-        setTelemetry(data);
-        setConnected(true);
-        setLastError(null);
+
+        if (data.hasData) {
+          setTelemetry(data.telemetry);
+          setConnected(!data.stale);
+          setStale(!!data.stale);
+          setAgeMs(data.ageMs);
+        } else {
+          setConnected(false);
+          setStale(false);
+          setTelemetry(null);
+          setAgeMs(null);
+        }
       } catch (e) {
         if (cancelled) return;
         setConnected(false);
-        setLastError(e.message || 'unreachable');
       }
     };
     poll();
     const id = setInterval(poll, 1000);
     return () => { cancelled = true; clearInterval(id); };
-  }, [deviceUrl]);
+  }, []);
 
-  return { connected, telemetry, lastError, deviceUrl };
+  return { connected, telemetry, stale, ageMs };
 }
 
 // Compact status chip shown at top-right of Overview when device connected
-function LiveDeviceBadge({ connected, telemetry }) {
+function LiveDeviceBadge({ connected, telemetry, stale, ageMs }) {
+  let label, bg, color, border, dotColor;
+  if (connected) {
+    label = 'LIVE · ChYme device';
+    bg = T.successWash; color = T.success;
+    border = '#a7d9bf'; dotColor = T.success;
+  } else if (stale) {
+    label = `STALE · last update ${Math.round((ageMs || 0) / 1000)}s ago`;
+    bg = T.amberWash; color = T.amber;
+    border = '#e4c98a'; dotColor = T.amber;
+  } else {
+    label = 'Device offline (sim mode)';
+    bg = '#f4f4f5'; color = T.textMuted;
+    border = T.hairline; dotColor = T.textMuted;
+  }
+
   return (
     <div style={{
       display: 'inline-flex',
@@ -2172,19 +2192,18 @@ function LiveDeviceBadge({ connected, telemetry }) {
       gap: '8px',
       padding: '6px 12px',
       borderRadius: '999px',
-      background: connected ? T.successWash : '#f4f4f5',
-      color: connected ? T.success : T.textMuted,
+      background: bg,
+      color,
       fontSize: '12px',
       fontWeight: 600,
-      border: `1px solid ${connected ? '#a7d9bf' : T.hairline}`,
+      border: `1px solid ${border}`,
     }}>
       <span style={{
         width: '8px', height: '8px', borderRadius: '50%',
-        background: connected ? T.success : T.textMuted,
-        boxShadow: connected ? `0 0 0 3px ${T.success}30` : 'none',
-        animation: connected ? 'chyme-spin 2s linear infinite, none' : 'none',
+        background: dotColor,
+        boxShadow: connected ? `0 0 0 3px ${dotColor}30` : 'none',
       }}/>
-      {connected ? 'LIVE · ChYme device' : 'Device offline (sim mode)'}
+      {label}
       {connected && telemetry && (
         <span style={{ color: T.textMuted, fontWeight: 500, marginLeft: '4px' }}>
           · idle {telemetry.idle_s}s · {telemetry.swallow_count} swallows
@@ -2194,12 +2213,148 @@ function LiveDeviceBadge({ connected, telemetry }) {
   );
 }
 
+// Live sensor panel — shown when device is connected. Surfaces real-time
+// ML classification probabilities and MPU-6050 accelerometer magnitudes.
+function LiveSensorPanel({ telemetry }) {
+  const probs = telemetry.probs || {};
+  const classes = ['swallow', 'idle', 'cough', 'speech'];
+  const classColors = {
+    swallow: T.tealPrimary,
+    idle:    T.textMuted,
+    cough:   T.coral,
+    speech:  T.amber,
+  };
+  const top = classes.reduce((a, b) => (probs[b] || 0) > (probs[a] || 0) ? b : a, 'idle');
+
+  return (
+    <div style={{
+      background: T.canvas,
+      borderRadius: '16px',
+      padding: '18px 22px',
+      border: `1px solid ${T.hairline}`,
+      marginBottom: '16px',
+      display: 'grid',
+      gridTemplateColumns: '1.3fr 1fr',
+      gap: '22px',
+    }}>
+      {/* --- LEFT: ML classification --- */}
+      <div>
+        <div style={{
+          display: 'flex',
+          alignItems: 'center',
+          gap: '10px',
+          marginBottom: '14px',
+        }}>
+          <IconBadge color={T.tealPrimary} bg={T.tealWash}>{icons.activity}</IconBadge>
+          <div>
+            <div style={{ fontSize: '14px', fontWeight: 600, color: T.textDeep }}>
+              Live ML classification
+            </div>
+            <div style={{ fontSize: '12px', color: T.textMuted, marginTop: '2px' }}>
+              Edge Impulse · 4-class · <span style={{ fontWeight: 600, color: classColors[top], textTransform: 'capitalize' }}>{top}</span>
+            </div>
+          </div>
+        </div>
+        {classes.map((cls) => {
+          const p = probs[cls] || 0;
+          return (
+            <div key={cls} style={{
+              display: 'grid',
+              gridTemplateColumns: '72px 1fr 48px',
+              alignItems: 'center',
+              gap: '12px',
+              padding: '4px 0',
+            }}>
+              <span style={{
+                fontSize: '12px',
+                fontWeight: 600,
+                color: classColors[cls],
+                textTransform: 'capitalize',
+              }}>
+                {cls}
+              </span>
+              <div style={{
+                height: '8px',
+                background: T.hairlineSoft,
+                borderRadius: '999px',
+                overflow: 'hidden',
+              }}>
+                <div style={{
+                  height: '100%',
+                  width: `${Math.max(p * 100, 2)}%`,
+                  background: classColors[cls],
+                  borderRadius: '999px',
+                  transition: 'width 0.4s ease-out',
+                }}/>
+              </div>
+              <span style={{
+                fontSize: '12px',
+                fontWeight: 500,
+                color: T.textMuted,
+                fontVariantNumeric: 'tabular-nums',
+                textAlign: 'right',
+              }}>
+                {(p * 100).toFixed(0)}%
+              </span>
+            </div>
+          );
+        })}
+      </div>
+
+      {/* --- RIGHT: MPU-6050 accelerometer values --- */}
+      <div>
+        <div style={{
+          fontSize: '11px',
+          fontWeight: 600,
+          color: T.textMuted,
+          letterSpacing: '0.08em',
+          textTransform: 'uppercase',
+          marginBottom: '12px',
+        }}>
+          Accelerometer (RMS, g)
+        </div>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
+          <SensorReading label="Throat" value={telemetry.throat_rms} color={T.tealPrimary} />
+          <SensorReading label="Sternum" value={telemetry.sternum_rms} color={T.amber} />
+          <SensorReading label="T/S Ratio" value={telemetry.ratio} color={T.textDeep} dimensionless />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function SensorReading({ label, value, color, dimensionless }) {
+  const v = typeof value === 'number' ? value : 0;
+  return (
+    <div style={{
+      display: 'flex',
+      justifyContent: 'space-between',
+      alignItems: 'baseline',
+      padding: '7px 10px',
+      background: T.tealTint,
+      borderRadius: '8px',
+      borderLeft: `3px solid ${color}`,
+    }}>
+      <span style={{ fontSize: '12px', color: T.textMuted, fontWeight: 500 }}>{label}</span>
+      <span style={{
+        fontSize: '16px',
+        fontWeight: 700,
+        color: T.textDeep,
+        fontVariantNumeric: 'tabular-nums',
+      }}>
+        {v.toFixed(dimensionless ? 2 : 3)}
+      </span>
+    </div>
+  );
+}
+
+
 // ============================================================
 // OVERVIEW PAGE
 // ============================================================
 
 function OverviewPage({ thresholds }) {
-  const { connected: deviceConnected, telemetry: deviceTelemetry } = useDeviceTelemetry();
+  const { connected: deviceConnected, telemetry: deviceTelemetry, stale: deviceStale, ageMs: deviceAgeMs } = useDeviceTelemetry();
 
   const realLastSwallow = todaySwallows[todaySwallows.length - 1] || new Date();
   const [lastSwallowOverride, setLastSwallowOverride] = useState(null);
@@ -2248,7 +2403,12 @@ function OverviewPage({ thresholds }) {
         display: 'flex',
         justifyContent: 'flex-end',
       }}>
-        <LiveDeviceBadge connected={deviceConnected} telemetry={deviceTelemetry} />
+        <LiveDeviceBadge
+          connected={deviceConnected}
+          telemetry={deviceTelemetry}
+          stale={deviceStale}
+          ageMs={deviceAgeMs}
+        />
       </div>
       <div style={{
         display: 'grid',
@@ -2273,12 +2433,14 @@ function OverviewPage({ thresholds }) {
             icon={icons.droplet}
             iconColor={T.tealPrimary}
             iconBg={T.tealWash}
-            title="Today"
-            value={todaySwallows.length}
+            title={deviceConnected ? "Today · LIVE" : "Today"}
+            value={deviceConnected && deviceTelemetry
+              ? deviceTelemetry.swallow_count
+              : todaySwallows.length}
             unit="swallows"
-            delta={`${Math.abs(deltaPct)}%`}
+            delta={deviceConnected ? undefined : `${Math.abs(deltaPct)}%`}
             deltaDirection={delta >= 0 ? 'up' : 'down'}
-            trend="vs expected"
+            trend={deviceConnected ? "from device" : "vs expected"}
             sparkline={<BarSparkline data={hourlySwallowCounts} color={T.tealPrimary} highlightIndex={hourlySwallowCounts.length - 1} />}
           />
           <KPICard
@@ -2310,6 +2472,10 @@ function OverviewPage({ thresholds }) {
           />
         </div>
       </div>
+
+      {deviceConnected && deviceTelemetry && (
+        <LiveSensorPanel telemetry={deviceTelemetry} />
+      )}
 
       <div style={{
         display: 'grid',
