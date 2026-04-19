@@ -232,7 +232,7 @@ const T = {
   hairlineSoft: '#f4f6f5',
 };
 
-const DEFAULT_THRESHOLDS = { tier1: 60, tier2: 120, tier3: 240, tier4: 420 };
+const DEFAULT_THRESHOLDS = { tier1: 50, tier2: 80, tier3: 110, tier4: 110 };
 const THRESHOLDS_STORAGE_KEY = 'chyme.thresholds';
 const CAREGIVER_PHONE_KEY = 'chyme_caregiver_phone';
 
@@ -1081,8 +1081,8 @@ function SOSOverlay({ secondsSince, onDismiss }) {
   );
 
   const readPhone = () => {
-    try { return localStorage.getItem(CAREGIVER_PHONE_KEY) || ''; }
-    catch { return ''; }
+    try { return localStorage.getItem(CAREGIVER_PHONE_KEY) || '+17655329594'; }
+    catch { return '+17655329594'; }
   };
 
   const handleCaregiver = async (e) => {
@@ -2118,10 +2118,89 @@ function AlertLog({ nudges }) {
 }
 
 // ============================================================
+// LIVE DEVICE TELEMETRY HOOK
+// Polls the UNO Q HTTP /status endpoint on port 7000.
+// Returns { connected, telemetry } — telemetry shape matches main.py.
+// ============================================================
+
+const DEFAULT_DEVICE_URL = 'http://172.20.10.2:7000/status';
+const DEVICE_URL_KEY = 'chyme.deviceUrl';
+
+function useDeviceTelemetry() {
+  const [deviceUrl] = useState(() => {
+    try { return localStorage.getItem(DEVICE_URL_KEY) || DEFAULT_DEVICE_URL; }
+    catch { return DEFAULT_DEVICE_URL; }
+  });
+  const [connected, setConnected] = useState(false);
+  const [telemetry, setTelemetry] = useState(null);
+  const [lastError, setLastError] = useState(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const ctrl = new AbortController();
+        const timer = setTimeout(() => ctrl.abort(), 1500);
+        const r = await fetch(deviceUrl, { signal: ctrl.signal });
+        clearTimeout(timer);
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const data = await r.json();
+        if (cancelled) return;
+        setTelemetry(data);
+        setConnected(true);
+        setLastError(null);
+      } catch (e) {
+        if (cancelled) return;
+        setConnected(false);
+        setLastError(e.message || 'unreachable');
+      }
+    };
+    poll();
+    const id = setInterval(poll, 1000);
+    return () => { cancelled = true; clearInterval(id); };
+  }, [deviceUrl]);
+
+  return { connected, telemetry, lastError, deviceUrl };
+}
+
+// Compact status chip shown at top-right of Overview when device connected
+function LiveDeviceBadge({ connected, telemetry }) {
+  return (
+    <div style={{
+      display: 'inline-flex',
+      alignItems: 'center',
+      gap: '8px',
+      padding: '6px 12px',
+      borderRadius: '999px',
+      background: connected ? T.successWash : '#f4f4f5',
+      color: connected ? T.success : T.textMuted,
+      fontSize: '12px',
+      fontWeight: 600,
+      border: `1px solid ${connected ? '#a7d9bf' : T.hairline}`,
+    }}>
+      <span style={{
+        width: '8px', height: '8px', borderRadius: '50%',
+        background: connected ? T.success : T.textMuted,
+        boxShadow: connected ? `0 0 0 3px ${T.success}30` : 'none',
+        animation: connected ? 'chyme-spin 2s linear infinite, none' : 'none',
+      }}/>
+      {connected ? 'LIVE · ChYme device' : 'Device offline (sim mode)'}
+      {connected && telemetry && (
+        <span style={{ color: T.textMuted, fontWeight: 500, marginLeft: '4px' }}>
+          · idle {telemetry.idle_s}s · {telemetry.swallow_count} swallows
+        </span>
+      )}
+    </div>
+  );
+}
+
+// ============================================================
 // OVERVIEW PAGE
 // ============================================================
 
 function OverviewPage({ thresholds }) {
+  const { connected: deviceConnected, telemetry: deviceTelemetry } = useDeviceTelemetry();
+
   const realLastSwallow = todaySwallows[todaySwallows.length - 1] || new Date();
   const [lastSwallowOverride, setLastSwallowOverride] = useState(null);
   const lastSwallow = lastSwallowOverride || realLastSwallow;
@@ -2132,7 +2211,13 @@ function OverviewPage({ thresholds }) {
     return () => clearInterval(id);
   }, []);
 
-  const secondsSince = Math.max(0, Math.floor((now - lastSwallow) / 1000));
+  // When device is connected, OVERRIDE the fake counter with real UNO Q idle_s.
+  // When offline, fall back to the simulated behaviour.
+  const simSecondsSince = Math.max(0, Math.floor((now - lastSwallow) / 1000));
+  const secondsSince = deviceConnected && deviceTelemetry
+    ? deviceTelemetry.idle_s
+    : simSecondsSince;
+
   const tier = secondsSince >= thresholds.tier4 ? 4
              : secondsSince >= thresholds.tier3 ? 3
              : secondsSince >= thresholds.tier2 ? 2
@@ -2158,6 +2243,13 @@ function OverviewPage({ thresholds }) {
 
   return (
     <>
+      <div style={{
+        marginBottom: '12px',
+        display: 'flex',
+        justifyContent: 'flex-end',
+      }}>
+        <LiveDeviceBadge connected={deviceConnected} telemetry={deviceTelemetry} />
+      </div>
       <div style={{
         display: 'grid',
         gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))',
@@ -3894,7 +3986,14 @@ function SettingsPage({ thresholds, setThresholds }) {
 
 function EmergencyContactSection() {
   const [phone, setPhone] = useState(() => {
-    try { return localStorage.getItem(CAREGIVER_PHONE_KEY) || ''; }
+    try {
+      const stored = localStorage.getItem(CAREGIVER_PHONE_KEY);
+      if (stored) return stored;
+      // Default for demo — saves it so the SOS overlay can call it immediately
+      const demo = '+17655329594';
+      localStorage.setItem(CAREGIVER_PHONE_KEY, demo);
+      return demo;
+    }
     catch { return ''; }
   });
   const [status, setStatus] = useState(null);
