@@ -3,16 +3,28 @@ import jsPDF from 'jspdf';
 import html2canvas from 'html2canvas';
 
 // ============================================================
-// SIMULATED DATA — replace with real wearable data later
+// SIMULATED DATA. Replace with real wearable data later.
 // ============================================================
 
-// Realistic inter-swallow gap (ms) — most between 30–60s, long tail out to 420s+
-function randomGapMs() {
+// Inter-swallow gap distribution during waking hours.
+// Targets ~300-350 waking swallows/day, with rare 420s+ gaps driving SOS events.
+function randomWakingGapMs() {
   const r = Math.random();
-  if (r < 0.55) return 30000 + Math.random() * 30000;    // 30–60s (55%)
-  if (r < 0.82) return 60000 + Math.random() * 60000;    // 60–120s (27%)
-  if (r < 0.96) return 120000 + Math.random() * 120000;  // 120–240s (14%)
-  return 240000 + Math.random() * 180000;                // 240–420s (4%)
+  if (r < 0.25) return 30000 + Math.random() * 30000;     // 30–60s   (25%)
+  if (r < 0.50) return 60000 + Math.random() * 60000;     // 60–120s  (25%)
+  if (r < 0.72) return 120000 + Math.random() * 120000;   // 120–240s (22%)
+  if (r < 0.9988) return 240000 + Math.random() * 180000; // 240–420s (27.9%)
+  return 420000 + Math.random() * 180000;                 // 420–600s (0.12%) SOS
+}
+
+// Overnight (11pm–7am). Natural physiology: saliva swallows still occur,
+// but sparsely. ~6–10 per 8h sleep period.
+function randomSleepGapMs() {
+  return 2700000 + Math.random() * 2700000; // 45–90 min
+}
+
+function isSleepHour(hour) {
+  return hour >= 23 || hour < 7;
 }
 
 function generateSwallowsForDay(dayOffset = 0) {
@@ -20,30 +32,49 @@ function generateSwallowsForDay(dayOffset = 0) {
   const now = new Date();
   const dayStart = new Date(now);
   dayStart.setDate(dayStart.getDate() - dayOffset);
-  dayStart.setHours(7, 0, 0, 0);
+  dayStart.setHours(0, 0, 0, 0);
 
   const dayEnd = new Date(dayStart);
-  dayEnd.setHours(22, 30, 0, 0);
+  dayEnd.setDate(dayEnd.getDate() + 1);
 
   const endTime = dayOffset === 0 ? Math.min(now.getTime(), dayEnd.getTime()) : dayEnd.getTime();
 
   let t = dayStart.getTime();
   while (t < endTime) {
     swallows.push(new Date(t));
-    t += randomGapMs();
+    const hour = new Date(t).getHours();
+    t += isSleepHour(hour) ? randomSleepGapMs() : randomWakingGapMs();
   }
   return swallows;
 }
 
-function generateNudges(swallows, threshold = 60000) {
+const NUDGE_THRESHOLD_MS = 60000;
+const SOS_THRESHOLD_MS = 420000;
+
+function generateNudges(swallows) {
   const nudges = [];
   for (let i = 1; i < swallows.length; i++) {
     const gap = swallows[i].getTime() - swallows[i - 1].getTime();
-    if (gap > threshold && Math.random() < 0.4) {
-      nudges.push(new Date(swallows[i - 1].getTime() + threshold + Math.random() * 5000));
-    }
+    if (gap <= NUDGE_THRESHOLD_MS) continue;
+    const nudgeTime = new Date(swallows[i - 1].getTime() + NUDGE_THRESHOLD_MS + Math.random() * 5000);
+    if (isSleepHour(nudgeTime.getHours())) continue;
+    if (Math.random() < 0.05) nudges.push(nudgeTime);
   }
   return nudges;
+}
+
+// SOS events: the device fires one whenever a waking gap crosses the 420s
+// threshold. Returns the timestamp at which the SOS would have triggered.
+function generateSOSEvents(swallows) {
+  const events = [];
+  for (let i = 1; i < swallows.length; i++) {
+    const gap = swallows[i].getTime() - swallows[i - 1].getTime();
+    if (gap < SOS_THRESHOLD_MS) continue;
+    const t = new Date(swallows[i - 1].getTime() + SOS_THRESHOLD_MS);
+    if (isSleepHour(t.getHours())) continue;
+    events.push(t);
+  }
+  return events;
 }
 
 // 30 days, ordered oldest-to-newest (index 0 = 29 days ago, index 29 = today)
@@ -51,17 +82,21 @@ const thirtyDayDetailedHistory = Array.from({ length: 30 }, (_, i) => {
   const d = 29 - i;
   const sws = generateSwallowsForDay(d);
   const nudges = generateNudges(sws);
+  const sosEvents = generateSOSEvents(sws);
   const date = new Date();
   date.setDate(date.getDate() - d);
-  return { date, swallows: sws, nudges };
+  return { date, swallows: sws, nudges, sosEvents };
 });
 
-// Last 7 days — same shape as before: index 6 = today
+// Last 7 days, same shape as before: index 6 = today
 const sevenDayDetailedHistory = thirtyDayDetailedHistory.slice(-7);
 
 const todaySwallows = sevenDayDetailedHistory[6].swallows;
 const yesterdaySwallows = sevenDayDetailedHistory[5].swallows;
 const todayNudges = sevenDayDetailedHistory[6].nudges;
+const todaySosEvents = sevenDayDetailedHistory[6].sosEvents;
+const yesterdayNudges = sevenDayDetailedHistory[5].nudges;
+const yesterdaySosEvents = sevenDayDetailedHistory[5].sosEvents;
 
 const sevenDayHistory = sevenDayDetailedHistory.map((d) => ({
   date: d.date,
@@ -71,6 +106,11 @@ const sevenDayHistory = sevenDayDetailedHistory.map((d) => ({
 
 const sevenDayAverage = Math.round(
   sevenDayHistory.reduce((sum, d) => sum + d.swallows, 0) / 7
+);
+
+// Average across the 6 days BEFORE today, used for "X% above/below" comparisons
+const weekAverageExToday = Math.round(
+  sevenDayHistory.slice(0, 6).reduce((sum, d) => sum + d.swallows, 0) / 6
 );
 
 // Flatten nudges across all 7 days with their preceding gap context
@@ -90,19 +130,29 @@ const allNudgesDetailed = sevenDayDetailedHistory.flatMap((day) =>
 );
 
 // Report metrics across the full 30-day window
+// Tier counts reflect device-delivered events.
+// - Tier 1 = gentle cues actually delivered (nudges)
+// - Tier 2/3 = delivered nudges whose surrounding gap continued past 120s/240s
+// - Tier 4 = SOS events (device-fired extended-inactivity alerts)
 const reportMetrics = (() => {
   let gentleCues = 0;
   let tier2 = 0, tier3 = 0, tier4 = 0;
   for (const day of thirtyDayDetailedHistory) {
     gentleCues += day.nudges.length;
-    for (let i = 1; i < day.swallows.length; i++) {
-      const gapSec = (day.swallows[i].getTime() - day.swallows[i - 1].getTime()) / 1000;
-      if (gapSec >= 120) tier2++;
-      if (gapSec >= 240) tier3++;
-      if (gapSec >= 420) tier4++;
+    tier4 += day.sosEvents.length;
+    for (const nudge of day.nudges) {
+      let before = null, after = null;
+      for (const s of day.swallows) {
+        if (s <= nudge) before = s;
+        else { after = s; break; }
+      }
+      if (before && after) {
+        const gapSec = (after.getTime() - before.getTime()) / 1000;
+        if (gapSec >= 120) tier2++;
+        if (gapSec >= 240) tier3++;
+      }
     }
   }
-  if (tier4 < 2) tier4 = 2 + Math.floor(Math.random() * 3); // ensure 2–4
   return { gentleCues, tier2, tier3, tier4 };
 })();
 
@@ -314,10 +364,11 @@ function Sidebar({ activePage, setActivePage }) {
     }}>
       {/* Logo */}
       <div style={{
-        padding: '0 12px 24px',
+        padding: '0 14px 24px',
         display: 'flex',
+        justifyContent: 'flex-start',
         alignItems: 'center',
-        gap: '10px',
+        gap: '12px',
       }}>
         <div style={{
           width: '30px',
@@ -398,13 +449,15 @@ function Sidebar({ activePage, setActivePage }) {
                 marginBottom: '4px',
                 cursor: 'pointer',
                 display: 'flex',
+                justifyContent: 'flex-start',
                 alignItems: 'center',
+                textAlign: 'left',
                 gap: '12px',
                 transition: 'background 0.15s ease',
               }}
             >
-              <span style={{ display: 'flex', alignItems: 'center' }}>{item.icon}</span>
-              <span style={{ flex: 1 }}>{item.label}</span>
+              <span style={{ display: 'flex', alignItems: 'center', flexShrink: 0 }}>{item.icon}</span>
+              <span style={{ flex: 1, textAlign: 'left' }}>{item.label}</span>
               {item.badge > 0 && (
                 <span style={{
                   background: T.coral,
@@ -478,12 +531,15 @@ function TopGreeting({ currentTime }) {
       alignItems: 'flex-start',
       marginBottom: '24px',
     }}>
-      <div>
+      <div style={{ textAlign: 'left' }}>
         <div style={{
           fontSize: '24px',
           fontWeight: 700,
           color: T.textDeep,
-          letterSpacing: '-0.02em',
+          lineHeight: 1.2,
+          margin: 0,
+          padding: 0,
+          textAlign: 'left',
         }}>
           Welcome back, Maria
         </div>
@@ -491,6 +547,10 @@ function TopGreeting({ currentTime }) {
           fontSize: '14px',
           color: T.textMuted,
           marginTop: '4px',
+          lineHeight: 1.2,
+          padding: 0,
+          marginLeft: 0,
+          textAlign: 'left',
         }}>
           Monitoring patient 0427 · {currentTime.toLocaleDateString([], { weekday: 'long', month: 'long', day: 'numeric' })}
         </div>
@@ -573,6 +633,9 @@ function KPICard({ icon, iconColor, iconBg, title, value, unit, delta, deltaDire
       borderRadius: '16px',
       padding: '20px',
       border: `1px solid ${T.hairline}`,
+      height: '100%',
+      display: 'flex',
+      flexDirection: 'column',
     }}>
       <div style={{
         display: 'flex',
@@ -589,7 +652,13 @@ function KPICard({ icon, iconColor, iconBg, title, value, unit, delta, deltaDire
         <div style={{ color: T.textFaint, cursor: 'pointer', fontSize: '18px', lineHeight: 1 }}>⋮</div>
       </div>
 
-      <div style={{ display: 'flex', alignItems: 'flex-end', justifyContent: 'space-between', gap: '16px' }}>
+      <div style={{
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'space-between',
+        gap: '16px',
+        flex: 1,
+      }}>
         <div style={{ flex: 1 }}>
           <div style={{ display: 'flex', alignItems: 'baseline', gap: '6px' }}>
             <div style={{
@@ -608,35 +677,43 @@ function KPICard({ icon, iconColor, iconBg, title, value, unit, delta, deltaDire
               </div>
             )}
           </div>
-          {delta && (
-            <div style={{
-              display: 'flex',
-              alignItems: 'center',
-              gap: '8px',
-              marginTop: '10px',
-            }}>
-              <div style={{
-                fontSize: '11px',
-                fontWeight: 600,
-                padding: '3px 8px',
-                borderRadius: '6px',
-                background: deltaDirection === 'up' ? T.successWash : T.coralWash,
-                color: deltaDirection === 'up' ? T.success : T.coral,
-                display: 'flex',
-                alignItems: 'center',
-                gap: '3px',
-              }}>
-                {delta}
-                <span style={{ fontSize: '10px' }}>
-                  {deltaDirection === 'up' ? '↗' : '↘'}
-                </span>
-              </div>
-              <div style={{ fontSize: '12px', color: T.textMuted }}>{trend}</div>
-            </div>
-          )}
+          <div style={{
+            minHeight: '22px',
+            marginTop: delta ? '10px' : '0',
+            display: 'flex',
+            alignItems: 'center',
+            gap: '8px',
+          }}>
+            {delta && (
+              <>
+                <div style={{
+                  fontSize: '11px',
+                  fontWeight: 600,
+                  padding: '3px 8px',
+                  borderRadius: '6px',
+                  background: deltaDirection === 'up' ? T.successWash : T.coralWash,
+                  color: deltaDirection === 'up' ? T.success : T.coral,
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '3px',
+                }}>
+                  {delta}
+                  <span style={{ fontSize: '10px' }}>
+                    {deltaDirection === 'up' ? '↗' : '↘'}
+                  </span>
+                </div>
+                <div style={{ fontSize: '12px', color: T.textMuted }}>{trend}</div>
+              </>
+            )}
+          </div>
         </div>
         {sparkline && (
-          <div style={{ width: '90px', height: '44px', flexShrink: 0 }}>
+          <div style={{
+            width: '90px',
+            height: '44px',
+            flexShrink: 0,
+            alignSelf: 'center',
+          }}>
             {sparkline}
           </div>
         )}
@@ -710,7 +787,7 @@ function LineSparkline({ data, color }) {
 }
 
 // ============================================================
-// CIRCULAR COUNTDOWN — PROMINENT HERO CARD
+// CIRCULAR COUNTDOWN: PROMINENT HERO CARD
 // ============================================================
 
 function CountdownHero({ lastSwallow, secondsSince, tier, thresholds, onReset }) {
@@ -756,7 +833,7 @@ function CountdownHero({ lastSwallow, secondsSince, tier, thresholds, onReset })
   }
 
   const progress = Math.min(secondsSince / Math.max(thresholds.tier4, 1), 1);
-  const radius = 72;
+  const radius = 58;
   const circumference = 2 * Math.PI * radius;
   const dashOffset = circumference * (1 - progress);
 
@@ -777,13 +854,13 @@ function CountdownHero({ lastSwallow, secondsSince, tier, thresholds, onReset })
       }}
     >
       {/* Circular countdown */}
-      <div style={{ position: 'relative', width: '180px', height: '180px', flexShrink: 0 }}>
-        <svg width="180" height="180" viewBox="0 0 180 180">
+      <div style={{ position: 'relative', width: '144px', height: '144px', flexShrink: 0 }}>
+        <svg width="144" height="144" viewBox="0 0 144 144">
           {/* Decorative outer dashed ring */}
           <circle
-            cx="90"
-            cy="90"
-            r={radius + 12}
+            cx="72"
+            cy="72"
+            r={radius + 10}
             fill="none"
             stroke={ringColor}
             strokeWidth="1"
@@ -791,28 +868,28 @@ function CountdownHero({ lastSwallow, secondsSince, tier, thresholds, onReset })
             opacity="0.3"
           />
           {/* White inner background */}
-          <circle cx="90" cy="90" r={radius} fill={T.canvas} />
+          <circle cx="72" cy="72" r={radius} fill={T.canvas} />
           {/* Background track */}
           <circle
-            cx="90"
-            cy="90"
+            cx="72"
+            cy="72"
             r={radius}
             fill="none"
             stroke={`${ringColor}20`}
-            strokeWidth="6"
+            strokeWidth="5"
           />
           {/* Progress */}
           <circle
-            cx="90"
-            cy="90"
+            cx="72"
+            cy="72"
             r={radius}
             fill="none"
             stroke={ringColor}
-            strokeWidth="6"
+            strokeWidth="5"
             strokeLinecap="round"
             strokeDasharray={circumference}
             strokeDashoffset={dashOffset}
-            transform="rotate(-90 90 90)"
+            transform="rotate(-90 72 72)"
             style={{ transition: 'stroke-dashoffset 1s linear, stroke 0.8s ease' }}
           />
         </svg>
@@ -825,7 +902,7 @@ function CountdownHero({ lastSwallow, secondsSince, tier, thresholds, onReset })
           justifyContent: 'center',
         }}>
           <div style={{
-            fontSize: '48px',
+            fontSize: '38px',
             fontWeight: 700,
             color: T.textDeep,
             lineHeight: 1,
@@ -838,7 +915,7 @@ function CountdownHero({ lastSwallow, secondsSince, tier, thresholds, onReset })
             fontSize: '10px',
             letterSpacing: '0.2em',
             textTransform: 'uppercase',
-            marginTop: '6px',
+            marginTop: '5px',
             color: T.textMuted,
             fontWeight: 600,
           }}>
@@ -848,9 +925,14 @@ function CountdownHero({ lastSwallow, secondsSince, tier, thresholds, onReset })
       </div>
 
       {/* Content */}
-      <div style={{ flex: 1 }}>
+      <div style={{
+        flex: 1,
+        display: 'flex',
+        flexDirection: 'column',
+      }}>
         <div style={{
           display: 'inline-flex',
+          alignSelf: 'flex-start',
           alignItems: 'center',
           gap: '6px',
           padding: '4px 10px',
@@ -1142,26 +1224,270 @@ function SOSOverlay({ secondsSince, calling, onCall, onDismiss }) {
 // 24-HOUR TIMELINE CHART
 // ============================================================
 
-function Timeline24h({ swallows, nudges }) {
-  const { windowStart, windowEnd } = useMemo(() => {
-    const end = new Date();
-    const start = new Date(end.getTime() - 24 * 60 * 60 * 1000);
-    return { windowStart: start, windowEnd: end };
-  }, []);
+function formatHourLabel(date) {
+  const h = date.getHours();
+  if (h === 0) return '12 AM';
+  if (h === 12) return '12 PM';
+  if (h < 12) return `${h} AM`;
+  return `${h - 12} PM`;
+}
 
-  const windowMs = windowEnd - windowStart;
-  const positionFor = (date) => Math.max(0, Math.min(100, ((date - windowStart) / windowMs) * 100));
+// Deterministic jitter. Same dot gets the same vertical offset every render.
+function swallowJitter(ms) {
+  const x = Math.sin(ms * 0.00017) * 43758.5453;
+  return ((x - Math.floor(x)) - 0.5) * 36; // ±18px
+}
 
-  const hourTicks = [];
-  const tickStart = new Date(windowStart);
-  tickStart.setMinutes(0, 0, 0);
-  tickStart.setHours(tickStart.getHours() + 1);
-  for (let t = tickStart.getTime(); t <= windowEnd.getTime(); t += 3 * 60 * 60 * 1000) {
-    hourTicks.push(new Date(t));
+function TimelineLegend() {
+  const Marker = ({ shape, color }) => {
+    if (shape === 'dot') {
+      return <div style={{ width: '8px', height: '8px', borderRadius: '50%', background: color }} />;
+    }
+    if (shape === 'diamond') {
+      return <div style={{ width: '9px', height: '9px', background: color, transform: 'rotate(45deg)' }} />;
+    }
+    return (
+      <div style={{
+        width: '11px', height: '11px', background: color,
+        border: '1.5px solid #fff', borderRadius: '2px',
+        boxShadow: `0 0 0 1px ${T.hairline}`,
+      }} />
+    );
+  };
+  return (
+    <div style={{
+      display: 'flex',
+      gap: '14px',
+      fontSize: '12px',
+      color: T.textBody,
+      alignItems: 'center',
+    }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+        <Marker shape="dot" color={T.tealPrimary} />
+        <span>Swallows</span>
+      </div>
+      <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+        <Marker shape="diamond" color={T.coral} />
+        <span>Nudges</span>
+      </div>
+      <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+        <Marker shape="square" color={T.tier4} />
+        <span>SOS</span>
+      </div>
+    </div>
+  );
+}
+
+function TimelineTooltip({ hovered }) {
+  if (!hovered) return null;
+  const timeStr = formatTime(hovered.time);
+  let text;
+  if (hovered.type === 'density') {
+    const r = hovered.rate;
+    text = `${timeStr}: approximately ${r} swallow${r === 1 ? '' : 's'} per hour`;
+  } else if (hovered.type === 'nudge') {
+    text = hovered.gap != null
+      ? `Haptic nudge delivered · ${timeStr} · ${hovered.gap}s gap`
+      : `Haptic nudge delivered · ${timeStr}`;
+  } else {
+    text = hovered.gap != null
+      ? `SOS triggered · ${timeStr} · ${hovered.gap}s without swallow`
+      : `SOS triggered · ${timeStr}`;
   }
 
-  const visibleSwallows = swallows.filter((s) => s >= windowStart && s <= windowEnd);
-  const visibleNudges = nudges.filter((n) => n >= windowStart && n <= windowEnd);
+  const below = hovered.placement === 'below';
+
+  const wrapperStyle = below
+    ? {
+        position: 'absolute',
+        left: `${hovered.xPercent}%`,
+        top: `${hovered.yPx + 12}px`,
+        transform: 'translateX(-50%)',
+        pointerEvents: 'none',
+        zIndex: 100,
+      }
+    : {
+        position: 'absolute',
+        left: `${hovered.xPercent}%`,
+        top: `${hovered.yPx - 14}px`,
+        transform: 'translate(-50%, -100%)',
+        pointerEvents: 'none',
+        zIndex: 100,
+      };
+
+  return (
+    <div style={wrapperStyle}>
+      {below && (
+        <div style={{
+          position: 'absolute',
+          left: '50%',
+          top: '-5px',
+          transform: 'translateX(-50%)',
+          width: 0, height: 0,
+          borderLeft: '5px solid transparent',
+          borderRight: '5px solid transparent',
+          borderBottom: `5px solid ${T.textDeep}`,
+        }} />
+      )}
+      <div style={{
+        background: T.textDeep,
+        color: '#fff',
+        padding: '7px 11px',
+        borderRadius: '6px',
+        fontSize: '11.5px',
+        fontWeight: 500,
+        whiteSpace: 'nowrap',
+        letterSpacing: '0.01em',
+        boxShadow: '0 6px 20px rgba(0,0,0,0.28)',
+      }}>
+        {text}
+      </div>
+      {!below && (
+        <div style={{
+          position: 'absolute',
+          left: '50%',
+          bottom: '-5px',
+          transform: 'translateX(-50%)',
+          width: 0, height: 0,
+          borderLeft: '5px solid transparent',
+          borderRight: '5px solid transparent',
+          borderTop: `5px solid ${T.textDeep}`,
+        }} />
+      )}
+    </div>
+  );
+}
+
+// Catmull-Rom → cubic Bezier smoothing for a sequence of (x,y) points
+function smoothLinePath(points) {
+  if (points.length === 0) return '';
+  if (points.length === 1) return `M ${points[0][0]},${points[0][1]}`;
+  let d = `M ${points[0][0]},${points[0][1]}`;
+  for (let i = 0; i < points.length - 1; i++) {
+    const p0 = points[i - 1] || points[i];
+    const p1 = points[i];
+    const p2 = points[i + 1];
+    const p3 = points[i + 2] || p2;
+    const cp1x = p1[0] + (p2[0] - p0[0]) / 6;
+    const cp1y = p1[1] + (p2[1] - p0[1]) / 6;
+    const cp2x = p2[0] - (p3[0] - p1[0]) / 6;
+    const cp2y = p2[1] - (p3[1] - p1[1]) / 6;
+    d += ` C ${cp1x.toFixed(2)},${cp1y.toFixed(2)} ${cp2x.toFixed(2)},${cp2y.toFixed(2)} ${p2[0]},${p2[1]}`;
+  }
+  return d;
+}
+
+function Timeline24h({ swallows, nudges, sosEvents, todayCount, weekAverage }) {
+  const [now, setNow] = useState(new Date());
+  useEffect(() => {
+    const id = setInterval(() => setNow(new Date()), 60000);
+    return () => clearInterval(id);
+  }, []);
+
+  const [hovered, setHovered] = useState(null);
+
+  const windowMs = 24 * 60 * 60 * 1000;
+  const windowStart = new Date(now.getTime() - windowMs);
+  const positionFor = (date) => Math.max(0, Math.min(100, ((date - windowStart) / windowMs) * 100));
+
+  const visibleNudges = nudges.filter((n) => n >= windowStart && n <= now);
+  const visibleSos = sosEvents.filter((s) => s >= windowStart && s <= now);
+
+  // Hourly bins. Each bucket count IS the swallows/hour rate.
+  const N_BUCKETS = 24;
+  const bucketMs = windowMs / N_BUCKETS;
+  const buckets = new Array(N_BUCKETS).fill(0);
+  for (const s of swallows) {
+    if (s < windowStart || s > now) continue;
+    const idx = Math.min(N_BUCKETS - 1, Math.floor((s - windowStart) / bucketMs));
+    buckets[idx]++;
+  }
+  const maxRate = Math.max(...buckets, 10);
+
+  // Device-event gap lookup
+  const allSwallowsSorted = [...swallows].sort((a, b) => a - b);
+  const findGap = (eventTime) => {
+    let before = null, after = null;
+    for (const s of allSwallowsSorted) {
+      if (s < eventTime) before = s;
+      else { after = s; break; }
+    }
+    if (before && after) return Math.round((after - before) / 1000);
+    return null;
+  };
+
+  // Axis: 9 labels, every 3 hours, last one is "Now"
+  const axisLabels = Array.from({ length: 9 }, (_, i) => {
+    const hoursBack = (8 - i) * 3;
+    const t = new Date(now.getTime() - hoursBack * 60 * 60 * 1000);
+    return {
+      xPercent: (i / 8) * 100,
+      label: i === 8 ? 'Now' : formatHourLabel(t),
+    };
+  });
+  const gridPositions = axisLabels.map((a) => a.xPercent);
+
+  // Comparison
+  let comparisonText, comparisonColor;
+  if (weekAverage > 0 && todayCount > 0) {
+    const pct = Math.round(((todayCount - weekAverage) / weekAverage) * 100);
+    if (pct > 1) {
+      comparisonText = `${pct}% above your 7-day average`;
+      comparisonColor = T.tealPrimary;
+    } else if (pct < -1) {
+      comparisonText = `${Math.abs(pct)}% below your 7-day average`;
+      comparisonColor = T.coral;
+    } else {
+      comparisonText = 'On par with your 7-day average';
+      comparisonColor = T.textMuted;
+    }
+  } else {
+    comparisonText = 'Building today\'s baseline';
+    comparisonColor = T.textMuted;
+  }
+
+  // Chart geometry
+  const CHART_HEIGHT = 180;      // total chart container
+  const TOP_STRIP_H = 26;         // strip for nudge/SOS markers
+  const PLOT_H = CHART_HEIGHT - TOP_STRIP_H;
+  const PLOT_PADDING_TOP = 10;
+  const SVG_W = 1000;             // SVG viewBox width for path math
+  const SVG_H = PLOT_H;
+
+  const points = buckets.map((count, i) => {
+    const x = ((i + 0.5) / N_BUCKETS) * SVG_W;
+    const usableH = SVG_H - PLOT_PADDING_TOP;
+    const y = SVG_H - (count / maxRate) * usableH;
+    return [x, y];
+  });
+
+  const linePath = smoothLinePath(points);
+  const areaPath = points.length
+    ? `${linePath} L ${points[points.length - 1][0]},${SVG_H} L ${points[0][0]},${SVG_H} Z`
+    : '';
+
+  const handleDensityMove = (e) => {
+    const rect = e.currentTarget.getBoundingClientRect();
+    const xPx = e.clientX - rect.left;
+    const yPxLocal = e.clientY - rect.top;
+    const clampedX = Math.max(0, Math.min(rect.width, xPx));
+    const xPercent = (clampedX / rect.width) * 100;
+    const timeMs = windowStart.getTime() + (clampedX / rect.width) * windowMs;
+    const time = new Date(timeMs);
+    const idx = Math.min(N_BUCKETS - 1, Math.max(0, Math.floor((timeMs - windowStart.getTime()) / bucketMs)));
+    const rate = buckets[idx];
+    // Mouse Y in chart-container coords; clamp so tooltip never overlaps the top marker strip
+    const mouseChartY = yPxLocal + TOP_STRIP_H;
+    const MIN_TOOLTIP_ANCHOR = TOP_STRIP_H + 54;
+    const tooltipY = Math.max(MIN_TOOLTIP_ANCHOR, mouseChartY);
+    setHovered({
+      type: 'density',
+      time,
+      rate,
+      xPercent,
+      yPx: tooltipY,
+    });
+  };
 
   return (
     <div style={{
@@ -1170,11 +1496,12 @@ function Timeline24h({ swallows, nudges }) {
       padding: '22px 24px',
       border: `1px solid ${T.hairline}`,
     }}>
+      {/* Header: title + comparison + legend */}
       <div style={{
         display: 'flex',
         justifyContent: 'space-between',
-        alignItems: 'center',
-        marginBottom: '8px',
+        alignItems: 'flex-start',
+        gap: '16px',
       }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
           <IconBadge color={T.tealPrimary} bg={T.tealWash}>{icons.activity}</IconBadge>
@@ -1182,108 +1509,305 @@ function Timeline24h({ swallows, nudges }) {
             <div style={{ fontSize: '15px', fontWeight: 600, color: T.textDeep }}>
               Swallow activity
             </div>
-            <div style={{ fontSize: '12px', color: T.textMuted, marginTop: '2px' }}>
-              Last 24 hours
+            <div style={{
+              fontSize: '12px',
+              color: comparisonColor,
+              marginTop: '3px',
+              fontWeight: 500,
+            }}>
+              {comparisonText}
             </div>
           </div>
         </div>
-        <div style={{ display: 'flex', gap: '14px', fontSize: '12px', color: T.textBody, alignItems: 'center' }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-            <div style={{ width: '8px', height: '8px', borderRadius: '50%', background: T.tealPrimary }} />
-            <span>Swallows</span>
-            <span style={{ color: T.textDeep, fontWeight: 600 }}>{visibleSwallows.length}</span>
-          </div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-            <div style={{ width: '2px', height: '12px', background: T.coral }} />
-            <span>Nudges</span>
-            <span style={{ color: T.textDeep, fontWeight: 600 }}>{visibleNudges.length}</span>
-          </div>
-        </div>
+        <TimelineLegend />
       </div>
 
-      <div style={{ marginTop: '20px' }}>
-        <div style={{ position: 'relative', height: '80px' }}>
+      {/* Chart container */}
+      <div style={{
+        position: 'relative',
+        height: `${CHART_HEIGHT}px`,
+        marginTop: '22px',
+        background: '#FAFAF7',
+        borderRadius: '10px',
+        border: `1px solid ${T.hairlineSoft}`,
+      }}>
+        {/* Gridlines */}
+        {gridPositions.map((p, i) => (
+          <div key={`g-${i}`} style={{
+            position: 'absolute',
+            left: `${p}%`,
+            top: 0, bottom: 0,
+            width: '1px',
+            background: 'rgba(0,0,0,0.035)',
+          }} />
+        ))}
+
+        {/* Top-strip separator */}
+        <div style={{
+          position: 'absolute',
+          left: 0, right: 0,
+          top: `${TOP_STRIP_H}px`,
+          height: '1px',
+          background: 'rgba(0,0,0,0.04)',
+        }} />
+
+        {/* Density area + line (SVG) */}
+        <svg
+          viewBox={`0 0 ${SVG_W} ${SVG_H}`}
+          preserveAspectRatio="none"
+          style={{
+            position: 'absolute',
+            left: 0, right: 0,
+            top: `${TOP_STRIP_H}px`,
+            width: '100%',
+            height: `${PLOT_H}px`,
+            pointerEvents: 'none',
+          }}
+        >
+          {areaPath && (
+            <path d={areaPath} fill="#9FE1CB" fillOpacity="0.4" />
+          )}
+          {points.length > 0 && (
+            <path
+              d={linePath}
+              fill="none"
+              stroke="#1D9E75"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              vectorEffect="non-scaling-stroke"
+            />
+          )}
+        </svg>
+
+        {/* Density hover layer, sits over the area, below markers */}
+        <div
+          onMouseMove={handleDensityMove}
+          onMouseLeave={() => setHovered(null)}
+          style={{
+            position: 'absolute',
+            top: `${TOP_STRIP_H}px`,
+            left: 0, right: 0, bottom: 0,
+            cursor: 'crosshair',
+            zIndex: 1,
+          }}
+        />
+
+        {/* Crosshair on density hover */}
+        {hovered?.type === 'density' && (
           <div style={{
             position: 'absolute',
-            left: 0,
-            right: 0,
-            top: '50%',
-            transform: 'translateY(-50%)',
-            height: '44px',
-            background: T.tealTint,
-            borderRadius: '6px',
+            left: `${hovered.xPercent}%`,
+            top: `${TOP_STRIP_H}px`,
+            bottom: 0,
+            width: '1px',
+            background: 'rgba(29, 158, 117, 0.35)',
+            pointerEvents: 'none',
+            zIndex: 2,
           }} />
-          {hourTicks.map((tick, i) => (
-            <div
-              key={i}
-              style={{
-                position: 'absolute',
-                left: `${positionFor(tick)}%`,
-                top: '50%',
-                transform: 'translate(-50%, -50%)',
-                width: '1px',
-                height: '44px',
-                background: 'rgba(45, 122, 110, 0.12)',
-              }}
-            />
-          ))}
-          {visibleSwallows.map((s, i) => (
-            <div
-              key={`s-${i}`}
-              title={formatTimeWithSeconds(s)}
-              style={{
-                position: 'absolute',
-                left: `${positionFor(s)}%`,
-                top: '50%',
-                transform: 'translate(-50%, -50%)',
-                width: '6px',
-                height: '6px',
-                borderRadius: '50%',
-                background: T.tealPrimary,
-                boxShadow: `0 0 0 2px ${T.canvas}`,
-              }}
-            />
-          ))}
-          {visibleNudges.map((n, i) => (
+        )}
+
+        {/* Nudges: centered in top strip */}
+        {visibleNudges.map((n, i) => {
+          const cx = positionFor(n);
+          return (
             <div
               key={`n-${i}`}
-              title={`Nudge at ${formatTimeWithSeconds(n)}`}
+              onMouseEnter={() => setHovered({
+                type: 'nudge',
+                time: n,
+                xPercent: cx,
+                yPx: TOP_STRIP_H / 2,
+                gap: findGap(n),
+                placement: 'below',
+              })}
+              onMouseLeave={() => setHovered(null)}
               style={{
                 position: 'absolute',
-                left: `${positionFor(n)}%`,
-                top: '50%',
-                transform: 'translate(-50%, -50%)',
-                width: '2px',
-                height: '54px',
+                left: `${cx}%`,
+                top: `${TOP_STRIP_H / 2}px`,
+                transform: 'translate(-50%, -50%) rotate(45deg)',
+                width: '10px',
+                height: '10px',
                 background: T.coral,
-                borderRadius: '1px',
+                cursor: 'pointer',
+                zIndex: 3,
+                boxShadow: '0 0 0 1.5px #FAFAF7',
               }}
             />
-          ))}
-        </div>
+          );
+        })}
 
-        <div style={{
-          position: 'relative',
-          height: '16px',
-          fontSize: '11px',
-          color: T.textFaint,
-          marginTop: '8px',
-          fontVariantNumeric: 'tabular-nums',
-        }}>
-          {hourTicks.map((tick, i) => (
+        {/* SOS: centered in top strip */}
+        {visibleSos.map((s, i) => {
+          const cx = positionFor(s);
+          return (
             <div
-              key={i}
+              key={`sos-${i}`}
+              onMouseEnter={() => setHovered({
+                type: 'sos',
+                time: s,
+                xPercent: cx,
+                yPx: TOP_STRIP_H / 2,
+                gap: findGap(s),
+                placement: 'below',
+              })}
+              onMouseLeave={() => setHovered(null)}
               style={{
                 position: 'absolute',
-                left: `${positionFor(tick)}%`,
-                transform: 'translateX(-50%)',
+                left: `${cx}%`,
+                top: `${TOP_STRIP_H / 2}px`,
+                transform: 'translate(-50%, -50%)',
+                width: '14px',
+                height: '14px',
+                background: T.tier4,
+                border: '2px solid #ffffff',
+                borderRadius: '2px',
+                cursor: 'pointer',
+                zIndex: 4,
+                boxShadow: `0 0 0 1px ${T.tier4Dark}`,
               }}
-            >
-              {tick.getHours().toString().padStart(2, '0')}:00
-            </div>
-          ))}
-        </div>
+            />
+          );
+        })}
+
+        <TimelineTooltip hovered={hovered} />
       </div>
+
+      {/* X-axis labels */}
+      <div style={{
+        position: 'relative',
+        height: '16px',
+        marginTop: '10px',
+        fontSize: '11px',
+        color: T.textFaint,
+        fontVariantNumeric: 'tabular-nums',
+      }}>
+        {axisLabels.map((a, i) => (
+          <div key={i} style={{
+            position: 'absolute',
+            left: `${a.xPercent}%`,
+            transform:
+              i === 0
+                ? 'translateX(0)'
+                : i === axisLabels.length - 1
+                ? 'translateX(-100%)'
+                : 'translateX(-50%)',
+            whiteSpace: 'nowrap',
+            fontWeight: a.label === 'Now' ? 600 : 400,
+            color: a.label === 'Now' ? T.textBody : T.textFaint,
+          }}>
+            {a.label}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+// OVERVIEW SUMMARY CARDS (below the timeline)
+// ============================================================
+
+function OverviewSummaryCard({ label, value, caption, captionColor }) {
+  return (
+    <div style={{
+      padding: '16px 18px',
+      background: T.canvas,
+      borderRadius: '12px',
+      border: `1px solid ${T.hairline}`,
+    }}>
+      <div style={{
+        fontSize: '11px',
+        fontWeight: 600,
+        color: T.textMuted,
+        letterSpacing: '0.08em',
+        textTransform: 'uppercase',
+      }}>
+        {label}
+      </div>
+      <div style={{
+        fontSize: '22px',
+        fontWeight: 700,
+        color: T.textDeep,
+        letterSpacing: '-0.01em',
+        marginTop: '8px',
+        fontVariantNumeric: 'tabular-nums',
+      }}>
+        {value}
+      </div>
+      <div style={{
+        fontSize: '11px',
+        color: captionColor,
+        marginTop: '6px',
+        fontWeight: 500,
+      }}>
+        {caption}
+      </div>
+    </div>
+  );
+}
+
+function OverviewSummaryRow({ todaySwallows }) {
+  // Waking-only gaps: include a gap only if its starting swallow is during waking hours.
+  const wakingGaps = [];
+  for (let i = 1; i < todaySwallows.length; i++) {
+    const prev = todaySwallows[i - 1];
+    if (isSleepHour(prev.getHours())) continue;
+    wakingGaps.push((todaySwallows[i].getTime() - prev.getTime()) / 1000);
+  }
+
+  const longestGapSec = wakingGaps.length ? Math.max(...wakingGaps) : 0;
+  const avgGapSec = wakingGaps.length ? wakingGaps.reduce((a, b) => a + b, 0) / wakingGaps.length : 0;
+
+  const formatGap = (sec) => {
+    const m = Math.floor(sec / 60);
+    const s = Math.round(sec % 60);
+    return `${m}m ${s}s`;
+  };
+
+  const longestTriggeredSos = longestGapSec >= 420;
+
+  let avgCaption, avgColor;
+  if (!wakingGaps.length) {
+    avgCaption = 'No data yet';
+    avgColor = T.textMuted;
+  } else if (avgGapSec < 120) {
+    avgCaption = 'Within healthy range';
+    avgColor = T.success;
+  } else if (avgGapSec <= 240) {
+    avgCaption = 'Elevated';
+    avgColor = T.amber;
+  } else {
+    avgCaption = 'Concerning';
+    avgColor = T.coral;
+  }
+
+  return (
+    <div style={{
+      display: 'grid',
+      gridTemplateColumns: '1fr 1fr',
+      gap: '14px',
+      width: '100%',
+    }}>
+      <OverviewSummaryCard
+        label="Longest gap (waking)"
+        value={wakingGaps.length ? formatGap(longestGapSec) : '-'}
+        caption={
+          !wakingGaps.length
+            ? 'No waking data yet'
+            : longestTriggeredSos
+            ? 'Triggered SOS'
+            : 'No intervention needed'
+        }
+        captionColor={longestTriggeredSos ? T.tier4 : T.textMuted}
+      />
+      <OverviewSummaryCard
+        label="Average gap (waking hours)"
+        value={wakingGaps.length ? formatGap(avgGapSec) : '-'}
+        caption={avgCaption}
+        captionColor={avgColor}
+      />
     </div>
   );
 }
@@ -1304,7 +1828,6 @@ function AlertLog({ nudges }) {
       flexDirection: 'column',
       overflow: 'hidden',
       height: '100%',
-      maxHeight: '440px',
     }}>
       <div style={{
         padding: '20px 22px 16px',
@@ -1359,24 +1882,41 @@ function AlertLog({ nudges }) {
               }}>
                 {icons.bell}
               </div>
-              <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{
+                flex: 1,
+                minWidth: 0,
+                height: '32px',
+                display: 'flex',
+                flexDirection: 'column',
+                justifyContent: 'center',
+              }}>
                 <div style={{
                   fontSize: '13px',
                   color: T.textDeep,
                   fontVariantNumeric: 'tabular-nums',
                   fontWeight: 600,
+                  lineHeight: 1.15,
                 }}>
                   {formatTimeWithSeconds(n)}
                 </div>
-                <div style={{ fontSize: '11px', color: T.textMuted, marginTop: '2px' }}>
+                <div style={{
+                  fontSize: '11px',
+                  color: T.textMuted,
+                  marginTop: '2px',
+                  lineHeight: 1.15,
+                }}>
                   Haptic cue delivered
                 </div>
               </div>
               <div style={{
+                height: '32px',
+                display: 'flex',
+                alignItems: 'center',
                 fontSize: '11px',
                 color: T.textFaint,
                 fontVariantNumeric: 'tabular-nums',
                 whiteSpace: 'nowrap',
+                lineHeight: 1.15,
               }}>
                 {timeLabel}
               </div>
@@ -1505,8 +2045,21 @@ function OverviewPage({ thresholds }) {
         gridTemplateColumns: '1.35fr 1fr',
         gap: '16px',
       }}>
-        <Timeline24h swallows={todaySwallows} nudges={todayNudges} />
-        <AlertLog nudges={todayNudges} />
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '16px', minWidth: 0 }}>
+          <Timeline24h
+            swallows={[...yesterdaySwallows, ...todaySwallows]}
+            nudges={[...yesterdayNudges, ...todayNudges]}
+            sosEvents={[...yesterdaySosEvents, ...todaySosEvents]}
+            todayCount={todaySwallows.length}
+            weekAverage={weekAverageExToday}
+          />
+          <OverviewSummaryRow todaySwallows={todaySwallows} />
+        </div>
+        <div style={{ position: 'relative', minWidth: 0 }}>
+          <div style={{ position: 'absolute', inset: 0 }}>
+            <AlertLog nudges={todayNudges} />
+          </div>
+        </div>
       </div>
 
       {tier >= 4 && (
@@ -1530,18 +2083,26 @@ function StatCard({ icon, iconColor, iconBg, title, value, unit }) {
     <div style={{
       background: T.canvas,
       borderRadius: '16px',
-      padding: '20px',
+      padding: '24px',
       border: `1px solid ${T.hairline}`,
       display: 'flex',
+      flexDirection: 'column',
       alignItems: 'center',
       gap: '14px',
+      textAlign: 'center',
     }}>
       <IconBadge color={iconColor} bg={iconBg}>{icon}</IconBadge>
       <div>
         <div style={{ fontSize: '13px', color: T.textMuted, fontWeight: 500 }}>{title}</div>
-        <div style={{ display: 'flex', alignItems: 'baseline', gap: '6px', marginTop: '4px' }}>
+        <div style={{
+          display: 'flex',
+          alignItems: 'baseline',
+          justifyContent: 'center',
+          gap: '6px',
+          marginTop: '6px',
+        }}>
           <div style={{
-            fontSize: '24px',
+            fontSize: '26px',
             fontWeight: 700,
             color: T.textDeep,
             lineHeight: 1,
@@ -1557,81 +2118,251 @@ function StatCard({ icon, iconColor, iconBg, title, value, unit }) {
 }
 
 function DayCard({ day }) {
+  // Full calendar day window (00:00–24:00)
   const dayStart = new Date(day.date);
-  dayStart.setHours(7, 0, 0, 0);
-  const dayEnd = new Date(day.date);
-  dayEnd.setHours(22, 30, 0, 0);
-  const windowMs = dayEnd - dayStart;
+  dayStart.setHours(0, 0, 0, 0);
+  const windowMs = 24 * 60 * 60 * 1000;
   const positionFor = (d) => Math.max(0, Math.min(100, ((d - dayStart) / windowMs) * 100));
 
   const today = new Date();
   const isToday = day.date.toDateString() === today.toDateString();
 
+  const [hovered, setHovered] = useState(null);
+
+  const CHART_H = 56;
+  const TOP_STRIP_H = 16;
+  const PLOT_H = CHART_H - TOP_STRIP_H;
+  const SVG_W = 1000;
+  const gridPositions = [0, 3, 6, 9, 12, 15, 18, 21, 24].map((h) => (h / 24) * 100);
+  const sosEvents = day.sosEvents || [];
+
+  const ROW_H = CHART_H;
+
+  // Hourly buckets for density curve
+  const N_BUCKETS = 24;
+  const bucketMs = windowMs / N_BUCKETS;
+  const buckets = new Array(N_BUCKETS).fill(0);
+  for (const s of day.swallows) {
+    const idx = Math.floor((s.getTime() - dayStart.getTime()) / bucketMs);
+    if (idx >= 0 && idx < N_BUCKETS) buckets[idx]++;
+  }
+  const maxRate = Math.max(...buckets, 3);
+
+  const points = buckets.map((count, i) => {
+    const x = ((i + 0.5) / N_BUCKETS) * SVG_W;
+    const usableH = PLOT_H - 3;
+    const y = PLOT_H - (count / maxRate) * usableH;
+    return [x, y];
+  });
+  const linePath = smoothLinePath(points);
+  const areaPath = points.length
+    ? `${linePath} L ${points[points.length - 1][0]},${PLOT_H} L ${points[0][0]},${PLOT_H} Z`
+    : '';
+
+  const allSwallowsSorted = [...day.swallows].sort((a, b) => a - b);
+  const findGap = (eventTime) => {
+    let before = null, after = null;
+    for (const s of allSwallowsSorted) {
+      if (s < eventTime) before = s;
+      else { after = s; break; }
+    }
+    if (before && after) return Math.round((after - before) / 1000);
+    return null;
+  };
+
+  const handleDensityMove = (e) => {
+    const rect = e.currentTarget.getBoundingClientRect();
+    const xPx = e.clientX - rect.left;
+    const yPxLocal = e.clientY - rect.top;
+    const clampedX = Math.max(0, Math.min(rect.width, xPx));
+    const xPercent = (clampedX / rect.width) * 100;
+    const timeMs = dayStart.getTime() + (clampedX / rect.width) * windowMs;
+    const time = new Date(timeMs);
+    const idx = Math.min(N_BUCKETS - 1, Math.max(0, Math.floor((timeMs - dayStart.getTime()) / bucketMs)));
+    const rate = buckets[idx];
+    setHovered({
+      type: 'density',
+      time,
+      rate,
+      xPercent,
+      yPx: yPxLocal + TOP_STRIP_H,
+    });
+  };
+
   return (
     <div style={{
       background: T.canvas,
       borderRadius: '16px',
-      padding: '18px 22px',
+      padding: '16px 22px',
       border: `1px solid ${T.hairline}`,
-      display: 'flex',
+      display: 'grid',
+      gridTemplateColumns: '100px 1fr auto',
+      columnGap: '20px',
       alignItems: 'center',
-      gap: '20px',
+      position: 'relative',
     }}>
-      <div style={{ width: '100px', flexShrink: 0 }}>
-        <div style={{ fontSize: '14px', fontWeight: 700, color: T.textDeep }}>
+      <div style={{
+        minHeight: `${ROW_H}px`,
+        display: 'flex',
+        flexDirection: 'column',
+        justifyContent: 'center',
+      }}>
+        <div style={{ fontSize: '14px', fontWeight: 700, color: T.textDeep, lineHeight: 1.15 }}>
           {isToday ? 'Today' : formatDayShort(day.date)}
         </div>
-        <div style={{ fontSize: '11px', color: T.textMuted, marginTop: '2px' }}>
+        <div style={{ fontSize: '11px', color: T.textMuted, marginTop: '3px', lineHeight: 1.15 }}>
           {day.date.toLocaleDateString([], { month: 'short', day: 'numeric' })}
         </div>
       </div>
 
-      <div style={{ flex: 1, minWidth: 0, position: 'relative', height: '40px' }}>
+      <div style={{
+        position: 'relative',
+        height: `${CHART_H}px`,
+        background: '#FAFAF7',
+        borderRadius: '8px',
+        border: `1px solid ${T.hairlineSoft}`,
+      }}>
+        {gridPositions.map((p, i) => (
+          <div key={`g${i}`} style={{
+            position: 'absolute',
+            left: `${p}%`,
+            top: 0, bottom: 0,
+            width: '1px',
+            background: 'rgba(0,0,0,0.03)',
+          }} />
+        ))}
+
+        {/* Top strip / plot separator */}
         <div style={{
           position: 'absolute',
-          left: 0, right: 0, top: '50%', transform: 'translateY(-50%)',
-          height: '24px',
-          background: T.tealTint,
-          borderRadius: '4px',
+          left: 0, right: 0,
+          top: `${TOP_STRIP_H}px`,
+          height: '1px',
+          background: 'rgba(0,0,0,0.04)',
         }} />
-        {day.swallows.map((s, i) => (
-          <div key={`s${i}`} style={{
+
+        {/* Density area + line */}
+        <svg
+          viewBox={`0 0 ${SVG_W} ${PLOT_H}`}
+          preserveAspectRatio="none"
+          style={{
             position: 'absolute',
-            left: `${positionFor(s)}%`,
-            top: '50%',
-            transform: 'translate(-50%, -50%)',
-            width: '4px',
-            height: '4px',
-            borderRadius: '50%',
-            background: T.tealPrimary,
-          }} />
-        ))}
-        {day.nudges.map((n, i) => (
-          <div key={`n${i}`} style={{
+            left: 0, right: 0,
+            top: `${TOP_STRIP_H}px`,
+            width: '100%',
+            height: `${PLOT_H}px`,
+            pointerEvents: 'none',
+          }}
+        >
+          {areaPath && <path d={areaPath} fill="#9FE1CB" fillOpacity="0.4" />}
+          {points.length > 0 && (
+            <path
+              d={linePath}
+              fill="none"
+              stroke="#1D9E75"
+              strokeWidth="1.6"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              vectorEffect="non-scaling-stroke"
+            />
+          )}
+        </svg>
+
+        {/* Density hover layer */}
+        <div
+          onMouseMove={handleDensityMove}
+          onMouseLeave={() => setHovered(null)}
+          style={{
             position: 'absolute',
-            left: `${positionFor(n)}%`,
-            top: '50%',
-            transform: 'translate(-50%, -50%)',
-            width: '2px',
-            height: '30px',
-            background: T.coral,
-            borderRadius: '1px',
-          }} />
-        ))}
+            top: `${TOP_STRIP_H}px`,
+            left: 0, right: 0, bottom: 0,
+            cursor: 'crosshair',
+            zIndex: 1,
+          }}
+        />
+
+        {/* Nudges at top strip */}
+        {day.nudges.map((n, i) => {
+          const cx = positionFor(n);
+          return (
+            <div
+              key={`n${i}`}
+              onMouseEnter={() => setHovered({
+                type: 'nudge',
+                time: n,
+                xPercent: cx,
+                yPx: TOP_STRIP_H / 2,
+                gap: findGap(n),
+              })}
+              onMouseLeave={() => setHovered(null)}
+              style={{
+                position: 'absolute',
+                left: `${cx}%`,
+                top: `${TOP_STRIP_H / 2}px`,
+                transform: 'translate(-50%, -50%) rotate(45deg)',
+                width: '8px',
+                height: '8px',
+                background: T.coral,
+                boxShadow: '0 0 0 1.5px #FAFAF7',
+                zIndex: 3,
+                cursor: 'pointer',
+              }}
+            />
+          );
+        })}
+
+        {/* SOS at top strip */}
+        {sosEvents.map((s, i) => {
+          const cx = positionFor(s);
+          return (
+            <div
+              key={`sos${i}`}
+              onMouseEnter={() => setHovered({
+                type: 'sos',
+                time: s,
+                xPercent: cx,
+                yPx: TOP_STRIP_H / 2,
+                gap: findGap(s),
+              })}
+              onMouseLeave={() => setHovered(null)}
+              style={{
+                position: 'absolute',
+                left: `${cx}%`,
+                top: `${TOP_STRIP_H / 2}px`,
+                transform: 'translate(-50%, -50%)',
+                width: '10px',
+                height: '10px',
+                background: T.tier4,
+                border: '2px solid #ffffff',
+                borderRadius: '2px',
+                boxShadow: `0 0 0 1px ${T.tier4Dark}`,
+                zIndex: 4,
+                cursor: 'pointer',
+              }}
+            />
+          );
+        })}
+
+        <TimelineTooltip hovered={hovered} />
       </div>
 
-      <div style={{ display: 'flex', gap: '24px', flexShrink: 0 }}>
+      <div style={{
+        minHeight: `${ROW_H}px`,
+        display: 'flex',
+        alignItems: 'center',
+        gap: '24px',
+      }}>
         <div style={{ textAlign: 'right' }}>
           <div style={{
             fontSize: '18px',
             fontWeight: 700,
             color: T.textDeep,
             fontVariantNumeric: 'tabular-nums',
-            lineHeight: 1,
+            lineHeight: 1.15,
           }}>
             {day.swallows.length}
           </div>
-          <div style={{ fontSize: '11px', color: T.textMuted, marginTop: '3px' }}>swallows</div>
+          <div style={{ fontSize: '11px', color: T.textMuted, marginTop: '3px', lineHeight: 1.15 }}>swallows</div>
         </div>
         <div style={{ textAlign: 'right' }}>
           <div style={{
@@ -1639,11 +2370,11 @@ function DayCard({ day }) {
             fontWeight: 700,
             color: T.coral,
             fontVariantNumeric: 'tabular-nums',
-            lineHeight: 1,
+            lineHeight: 1.15,
           }}>
             {day.nudges.length}
           </div>
-          <div style={{ fontSize: '11px', color: T.textMuted, marginTop: '3px' }}>nudges</div>
+          <div style={{ fontSize: '11px', color: T.textMuted, marginTop: '3px', lineHeight: 1.15 }}>nudges</div>
         </div>
       </div>
     </div>
@@ -2099,26 +2830,27 @@ function PatientProfilePage() {
 }
 
 // ============================================================
-// REPORTS PAGE — clinician-facing
+// REPORTS PAGE, clinician-facing
 // ============================================================
 
 function DailyCountLineChart({ data, avg }) {
   const W = 760, H = 260;
-  const PL = 44, PR = 24, PT = 24, PB = 40;
+  const PL = 48, PR = 32, PT = 24, PB = 40;
   const innerW = W - PL - PR;
   const innerH = H - PT - PB;
 
   const counts = data.map((d) => d.count);
   const maxRaw = Math.max(...counts, 1);
-  const maxY = Math.ceil((maxRaw * 1.15) / 50) * 50 || 50;
+  const step = 100;
+  const maxY = Math.max(step, Math.ceil((maxRaw * 1.1) / step) * step);
+  const tickValues = [];
+  for (let v = 0; v <= maxY; v += step) tickValues.push(v);
 
   const x = (i) => PL + (i / Math.max(data.length - 1, 1)) * innerW;
   const y = (v) => PT + innerH - (v / maxY) * innerH;
 
   const linePoints = data.map((d, i) => `${x(i)},${y(d.count)}`).join(' ');
   const areaPoints = `${x(0)},${PT + innerH} ${linePoints} ${x(data.length - 1)},${PT + innerH}`;
-
-  const yTicks = [0, 0.25, 0.5, 0.75, 1.0];
 
   return (
     <svg viewBox={`0 0 ${W} ${H}`} width="100%" style={{ display: 'block' }}>
@@ -2129,27 +2861,27 @@ function DailyCountLineChart({ data, avg }) {
         </linearGradient>
       </defs>
 
-      {yTicks.map((p, i) => (
+      {tickValues.map((v, i) => (
         <line
-          key={i}
+          key={`gl-${i}`}
           x1={PL}
           x2={PL + innerW}
-          y1={PT + innerH * (1 - p)}
-          y2={PT + innerH * (1 - p)}
+          y1={y(v)}
+          y2={y(v)}
           stroke={T.hairlineSoft}
           strokeWidth="1"
         />
       ))}
-      {yTicks.map((p, i) => (
+      {tickValues.map((v, i) => (
         <text
-          key={i}
+          key={`yt-${i}`}
           x={PL - 10}
-          y={PT + innerH * (1 - p) + 4}
+          y={y(v) + 4}
           textAnchor="end"
           fontSize="11"
           fill={T.textMuted}
         >
-          {Math.round(maxY * p)}
+          {v}
         </text>
       ))}
 
@@ -2176,27 +2908,6 @@ function DailyCountLineChart({ data, avg }) {
         strokeWidth="1.5"
         strokeDasharray="5 4"
       />
-      <rect
-        x={PL + innerW - 118}
-        y={y(avg) - 20}
-        width="114"
-        height="18"
-        rx="4"
-        fill={T.canvas}
-        stroke={T.coral}
-        strokeWidth="1"
-      />
-      <text
-        x={PL + innerW - 10}
-        y={y(avg) - 7}
-        textAnchor="end"
-        fontSize="11"
-        fill={T.coral}
-        fontWeight="600"
-      >
-        30-day avg: {Math.round(avg)}
-      </text>
-
       {data.map((d, i) => {
         if (i % 5 !== 0 && i !== data.length - 1) return null;
         return (
@@ -2219,7 +2930,7 @@ function DailyCountLineChart({ data, avg }) {
 function GapHistogram({ buckets }) {
   const labels = ['0–30s', '30–60s', '60–120s', '120–240s', '240s+'];
   const W = 760, H = 260;
-  const PL = 44, PR = 24, PT = 24, PB = 40;
+  const PL = 44, PR = 44, PT = 24, PB = 40;
   const innerW = W - PL - PR;
   const innerH = H - PT - PB;
 
@@ -2325,6 +3036,8 @@ function ClinicalNotes() {
         resize: 'vertical',
         lineHeight: 1.55,
         outline: 'none',
+        textAlign: 'left',
+        display: 'block',
       }}
       onFocus={(e) => { e.currentTarget.style.borderColor = T.tealPrimary; }}
       onBlur={(e) => { e.currentTarget.style.borderColor = T.hairline; }}
@@ -2386,8 +3099,7 @@ function ReportsPage() {
   const endDate = thirtyDayDetailedHistory[thirtyDayDetailedHistory.length - 1].date;
   const generatedAt = new Date();
 
-  const fmtRange = (d) => d.toLocaleDateString([], { month: 'long', day: 'numeric', year: 'numeric' });
-  const fmtGen = (d) => d.toLocaleDateString([], { weekday: 'long', month: 'short', day: 'numeric', year: 'numeric' });
+  const fmtShort = (d) => d.toLocaleDateString([], { month: 'short', day: 'numeric', year: 'numeric' });
 
   const handleDownload = async () => {
     if (!reportRef.current) return;
@@ -2436,65 +3148,51 @@ function ReportsPage() {
         background: T.canvas,
         borderRadius: '16px',
         border: `1px solid ${T.hairline}`,
-        padding: '32px 36px',
+        padding: '24px',
         display: 'flex',
         flexDirection: 'column',
         gap: '28px',
       }}>
         {/* 1. Header */}
-        <div style={{
-          display: 'flex',
-          justifyContent: 'space-between',
-          alignItems: 'flex-start',
-          gap: '20px',
-          paddingBottom: '22px',
-          borderBottom: `1px solid ${T.hairline}`,
-        }}>
-          <div>
+        <div style={{ paddingBottom: '20px', borderBottom: `1px solid ${T.hairline}` }}>
+          <div style={{
+            display: 'flex',
+            justifyContent: 'space-between',
+            alignItems: 'baseline',
+            gap: '16px',
+          }}>
             <div style={{
-              fontSize: '11px',
-              fontWeight: 700,
-              color: T.tealPrimary,
-              letterSpacing: '0.18em',
-              textTransform: 'uppercase',
-              marginBottom: '10px',
-            }}>
-              ChYme clinical report
-            </div>
-            <div style={{
-              fontSize: '26px',
-              fontWeight: 700,
+              fontSize: '24px',
+              fontWeight: 500,
               color: T.textDeep,
               letterSpacing: '-0.01em',
-              marginBottom: '8px',
             }}>
               Swallow Activity Report
             </div>
-            <div style={{ fontSize: '13px', color: T.textMuted, lineHeight: 1.6 }}>
-              <div><strong style={{ color: T.textDeep, fontWeight: 600 }}>{patientName}</strong> · {patientId}</div>
-              <div>Reporting period: {fmtRange(startDate)} – {fmtRange(endDate)}</div>
-              <div>Report generated: {fmtGen(generatedAt)}</div>
+            <div style={{ fontSize: '12px', color: T.textMuted, whiteSpace: 'nowrap' }}>
+              Generated {fmtShort(generatedAt)}
             </div>
           </div>
-          <div style={{
-            width: '56px',
-            height: '56px',
-            borderRadius: '14px',
-            background: T.tealWash,
-            color: T.tealPrimary,
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            flexShrink: 0,
-          }}>
-            <div style={{ transform: 'scale(1.6)' }}>{icons.chart}</div>
+          <div style={{ fontSize: '13px', color: T.textMuted, marginTop: '6px' }}>
+            {patientName} · {patientId} · Report period {fmtShort(startDate)} – {fmtShort(endDate)}
           </div>
         </div>
 
         {/* 2. Line chart */}
         <div>
-          <div style={{ fontSize: '15px', fontWeight: 600, color: T.textDeep, marginBottom: '4px' }}>
-            Daily swallow count
+          <div style={{
+            display: 'flex',
+            justifyContent: 'space-between',
+            alignItems: 'baseline',
+            gap: '16px',
+            marginBottom: '4px',
+          }}>
+            <div style={{ fontSize: '15px', fontWeight: 600, color: T.textDeep }}>
+              Daily swallow count
+            </div>
+            <div style={{ fontSize: '12px', color: T.textMuted, whiteSpace: 'nowrap' }}>
+              30-day average: {Math.round(avg)} swallows/day
+            </div>
           </div>
           <div style={{ fontSize: '12px', color: T.textMuted, marginBottom: '14px' }}>
             Past 30 days. Dashed line shows the 30-day average.
@@ -2523,9 +3221,9 @@ function ReportsPage() {
           </div>
           <div style={{ display: 'flex', gap: '12px', flexWrap: 'wrap' }}>
             <BigStat label="Gentle cues delivered" value={reportMetrics.gentleCues} color={T.coral} />
-            <BigStat label="Tier 2 — caregiver attention" value={reportMetrics.tier2} color={T.tier2} />
-            <BigStat label="Tier 3 — urgent" value={reportMetrics.tier3} color={T.tier3} />
-            <BigStat label="Tier 4 — emergency SOS" value={reportMetrics.tier4} color={T.tier4} />
+            <BigStat label="Tier 2: caregiver attention" value={reportMetrics.tier2} color={T.tier2} />
+            <BigStat label="Tier 3: urgent" value={reportMetrics.tier3} color={T.tier3} />
+            <BigStat label="Tier 4: emergency SOS" value={reportMetrics.tier4} color={T.tier4} />
           </div>
         </div>
 
@@ -2542,41 +3240,41 @@ function ReportsPage() {
       </div>
 
       {/* 6. Download button (outside the captured ref so it isn't in the PDF) */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: '14px' }}>
-        <button
-          onClick={handleDownload}
-          disabled={downloading}
-          onMouseEnter={(e) => { if (!downloading) e.currentTarget.style.background = '#1f5a51'; }}
-          onMouseLeave={(e) => { if (!downloading) e.currentTarget.style.background = T.tealPrimary; }}
-          style={{
-            padding: '14px 24px',
-            borderRadius: '12px',
-            border: 'none',
-            background: downloading ? T.textFaint : T.tealPrimary,
-            color: '#fff',
-            fontSize: '14px',
-            fontWeight: 600,
-            cursor: downloading ? 'wait' : 'pointer',
-            fontFamily: 'inherit',
-            letterSpacing: '0.01em',
-            display: 'inline-flex',
-            alignItems: 'center',
-            gap: '10px',
-            boxShadow: `0 2px 10px ${T.tealPrimary}33`,
-            transition: 'background 0.15s ease',
-          }}
-        >
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
-            <polyline points="7 10 12 15 17 10"/>
-            <line x1="12" y1="15" x2="12" y2="3"/>
-          </svg>
-          {downloading ? 'Preparing PDF…' : 'Download PDF report'}
-        </button>
-        {downloadError && (
-          <div style={{ fontSize: '13px', color: T.coral }}>{downloadError}</div>
-        )}
-      </div>
+      <button
+        onClick={handleDownload}
+        disabled={downloading}
+        onMouseEnter={(e) => { if (!downloading) e.currentTarget.style.background = '#1f5a51'; }}
+        onMouseLeave={(e) => { if (!downloading) e.currentTarget.style.background = T.tealPrimary; }}
+        style={{
+          width: '100%',
+          padding: '16px 24px',
+          borderRadius: '12px',
+          border: 'none',
+          background: downloading ? T.textFaint : T.tealPrimary,
+          color: '#fff',
+          fontSize: '14px',
+          fontWeight: 600,
+          cursor: downloading ? 'wait' : 'pointer',
+          fontFamily: 'inherit',
+          letterSpacing: '0.01em',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          gap: '10px',
+          boxShadow: `0 2px 10px ${T.tealPrimary}33`,
+          transition: 'background 0.15s ease',
+        }}
+      >
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+          <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+          <polyline points="7 10 12 15 17 10"/>
+          <line x1="12" y1="15" x2="12" y2="3"/>
+        </svg>
+        {downloading ? 'Preparing PDF…' : 'Download PDF report'}
+      </button>
+      {downloadError && (
+        <div style={{ fontSize: '13px', color: T.coral, textAlign: 'center' }}>{downloadError}</div>
+      )}
     </div>
   );
 }
@@ -2646,10 +3344,30 @@ function ThresholdInput({ label, sublabel, value, onChange }) {
       padding: '14px 0',
       borderBottom: `1px solid ${T.hairlineSoft}`,
       gap: '16px',
+      textAlign: 'left',
     }}>
-      <div style={{ flex: 1, minWidth: 0 }}>
-        <div style={{ fontSize: '14px', fontWeight: 600, color: T.textDeep }}>{label}</div>
-        <div style={{ fontSize: '12px', color: T.textMuted, marginTop: '2px' }}>{sublabel}</div>
+      <div style={{
+        flex: 1,
+        minWidth: 0,
+        textAlign: 'left',
+        display: 'flex',
+        flexDirection: 'column',
+        alignItems: 'flex-start',
+      }}>
+        <div style={{
+          fontSize: '14px',
+          fontWeight: 600,
+          color: T.textDeep,
+          textAlign: 'left',
+          width: '100%',
+        }}>{label}</div>
+        <div style={{
+          fontSize: '12px',
+          color: T.textMuted,
+          marginTop: '2px',
+          textAlign: 'left',
+          width: '100%',
+        }}>{sublabel}</div>
       </div>
       <div style={{
         display: 'flex',
@@ -2729,22 +3447,18 @@ function SettingsPage({ thresholds, setThresholds }) {
   const isDirty = JSON.stringify(draft) !== JSON.stringify(thresholds);
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: '16px', maxWidth: '720px' }}>
-      <div style={{
-        background: T.canvas,
-        borderRadius: '16px',
-        border: `1px solid ${T.hairline}`,
-        padding: '24px 28px',
-        display: 'flex',
-        alignItems: 'center',
-        gap: '14px',
-      }}>
-        <IconBadge color={T.tealPrimary} bg={T.tealWash}>{icons.settings}</IconBadge>
-        <div>
-          <div style={{ fontSize: '16px', fontWeight: 600, color: T.textDeep }}>Settings</div>
-          <div style={{ fontSize: '12px', color: T.textMuted, marginTop: '2px' }}>
-            Configuration for alerts and device behavior
-          </div>
+    <div style={{ display: 'flex', flexDirection: 'column', gap: '20px', maxWidth: '720px' }}>
+      <div style={{ textAlign: 'left' }}>
+        <div style={{
+          fontSize: '20px',
+          fontWeight: 600,
+          color: T.textDeep,
+          letterSpacing: '-0.01em',
+        }}>
+          Settings
+        </div>
+        <div style={{ fontSize: '13px', color: T.textMuted, marginTop: '4px' }}>
+          Configuration for alerts and device behavior
         </div>
       </div>
 
@@ -2752,7 +3466,7 @@ function SettingsPage({ thresholds, setThresholds }) {
         background: T.canvas,
         borderRadius: '16px',
         border: `1px solid ${T.hairline}`,
-        padding: '24px 28px',
+        padding: '24px',
       }}>
         <div style={{ marginBottom: '4px' }}>
           <SectionLabel>Alert thresholds</SectionLabel>
@@ -2800,16 +3514,18 @@ function SettingsPage({ thresholds, setThresholds }) {
             onClick={handleSave}
             disabled={!isDirty}
             style={{
-              padding: '10px 20px',
+              height: '40px',
+              padding: '0 22px',
               borderRadius: '10px',
               border: 'none',
-              background: isDirty ? T.tealPrimary : T.hairline,
-              color: isDirty ? '#fff' : T.textFaint,
+              background: T.tealPrimary,
+              color: '#fff',
               fontSize: '13px',
               fontWeight: 600,
               cursor: isDirty ? 'pointer' : 'not-allowed',
               fontFamily: 'inherit',
-              transition: 'background 0.15s ease',
+              opacity: isDirty ? 1 : 0.5,
+              transition: 'opacity 0.15s ease',
             }}
           >
             Save changes
@@ -2817,11 +3533,12 @@ function SettingsPage({ thresholds, setThresholds }) {
           <button
             onClick={handleRestore}
             style={{
-              padding: '10px 18px',
+              height: '40px',
+              padding: '0 22px',
               borderRadius: '10px',
-              border: `1px solid ${T.hairline}`,
-              background: T.canvas,
-              color: T.textBody,
+              border: `1px solid ${T.tealPrimary}55`,
+              background: 'transparent',
+              color: T.tealPrimary,
               fontSize: '13px',
               fontWeight: 600,
               cursor: 'pointer',
