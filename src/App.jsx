@@ -3863,6 +3863,293 @@ function ReportsPage() {
 }
 
 // ============================================================
+// LIVE MONITOR PAGE
+// Real-time view wired to /api/telemetry (UNO Q relay).
+// Shows classification, sensor values, rolling sparkline history,
+// idle timer with tier escalation, and running swallow count.
+// ============================================================
+
+const HISTORY_LEN = 60; // seconds of rolling buffer
+
+function useTelemetryHistory(telemetry, connected) {
+  const [history, setHistory] = useState([]);
+  useEffect(() => {
+    if (!connected || !telemetry) return;
+    setHistory((prev) => {
+      const next = [...prev, {
+        t: Date.now(),
+        swallow: telemetry.probs?.swallow || 0,
+        idle:    telemetry.probs?.idle    || 0,
+        cough:   telemetry.probs?.cough   || 0,
+        speech:  telemetry.probs?.speech  || 0,
+        throat:  telemetry.throat_rms     || 0,
+        sternum: telemetry.sternum_rms    || 0,
+        idle_s:  telemetry.idle_s         || 0,
+      }];
+      return next.slice(-HISTORY_LEN);
+    });
+  }, [telemetry, connected]);
+  return history;
+}
+
+function Sparkline({ values, color, height = 42, max }) {
+  if (!values || values.length === 0) {
+    return <div style={{ height, background: T.hairlineSoft, borderRadius: '6px' }}/>;
+  }
+  const W = 100, H = height;
+  const m = max ?? Math.max(1, ...values);
+  const pts = values.map((v, i) => {
+    const x = (i / Math.max(values.length - 1, 1)) * W;
+    const y = H - (v / m) * H;
+    return `${x.toFixed(2)},${y.toFixed(2)}`;
+  }).join(' ');
+  const area = `0,${H} ${pts} ${W},${H}`;
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none"
+         style={{ width: '100%', height, display: 'block' }}>
+      <polygon points={area} fill={color} opacity="0.12"/>
+      <polyline points={pts} fill="none" stroke={color} strokeWidth="1.5"
+                strokeLinejoin="round" strokeLinecap="round"/>
+    </svg>
+  );
+}
+
+function LiveMonitorPage({ thresholds }) {
+  const { connected, telemetry, stale, ageMs } = useDeviceTelemetry();
+  const history = useTelemetryHistory(telemetry, connected);
+
+  const idle_s = telemetry?.idle_s ?? 0;
+  const tier = idle_s >= thresholds.tier4 ? 4
+             : idle_s >= thresholds.tier3 ? 3
+             : idle_s >= thresholds.tier2 ? 2
+             : idle_s >= thresholds.tier1 ? 1 : 0;
+  const tierColor = tier >= 4 ? T.coral
+                 : tier >= 3 ? T.amber
+                 : tier >= 2 ? T.amber
+                 : tier >= 1 ? T.tealPrimary
+                 : T.success;
+  const tierLabel = ['Normal', 'Tier 1 · Notice', 'Tier 2 · Caution',
+                     'Tier 3 · Critical', 'Tier 4 · SOS'][tier];
+
+  const probs = telemetry?.probs || {};
+  const classes = ['swallow', 'idle', 'cough', 'speech'];
+  const classColors = {
+    swallow: T.tealPrimary,
+    idle:    T.textMuted,
+    cough:   T.coral,
+    speech:  T.amber,
+  };
+  const top = classes.reduce((a, b) => (probs[b] || 0) > (probs[a] || 0) ? b : a, 'idle');
+
+  return (
+    <div>
+      <div style={{
+        marginBottom: '16px',
+        display: 'flex',
+        justifyContent: 'space-between',
+        alignItems: 'center',
+      }}>
+        <div>
+          <div style={{
+            fontSize: '22px', fontWeight: 700, color: T.textDeep,
+            letterSpacing: '-0.01em',
+          }}>Live Monitor</div>
+          <div style={{ fontSize: '13px', color: T.textMuted, marginTop: '2px' }}>
+            Real-time stream from ChYme wearable · Edge Impulse model on UNO Q
+          </div>
+        </div>
+        <LiveDeviceBadge
+          connected={connected}
+          telemetry={telemetry}
+          stale={stale}
+          ageMs={ageMs}
+        />
+      </div>
+
+      {!connected && !stale && (
+        <div style={{
+          background: T.canvas,
+          border: `1px dashed ${T.hairline}`,
+          borderRadius: '16px',
+          padding: '56px 28px',
+          textAlign: 'center',
+        }}>
+          <div style={{
+            width: '64px', height: '64px', borderRadius: '16px',
+            background: T.tealWash, color: T.tealPrimary,
+            display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+            marginBottom: '16px',
+          }}>
+            <div style={{ transform: 'scale(1.8)' }}>{icons.activity}</div>
+          </div>
+          <div style={{ fontSize: '17px', fontWeight: 700, color: T.textDeep }}>
+            Waiting for device
+          </div>
+          <div style={{
+            fontSize: '13px', color: T.textMuted, marginTop: '6px',
+            maxWidth: '440px', marginLeft: 'auto', marginRight: 'auto', lineHeight: 1.55,
+          }}>
+            Power on the ChYme UNO Q wearable. Once <code>main.py</code> starts posting to
+            <code> /api/telemetry</code>, live classification and sensor data will appear here.
+          </div>
+        </div>
+      )}
+
+      {(connected || stale) && telemetry && (
+        <>
+          {/* Top stats */}
+          <div style={{
+            display: 'grid',
+            gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))',
+            gap: '16px',
+            marginBottom: '16px',
+          }}>
+            <StatCard
+              label="Idle since last swallow"
+              value={`${idle_s}s`}
+              accent={tierColor}
+              sub={tierLabel}
+            />
+            <StatCard
+              label="Swallow count (session)"
+              value={String(telemetry.swallow_count ?? 0)}
+              accent={T.tealPrimary}
+              sub="Detected events"
+            />
+            <StatCard
+              label="Top class"
+              value={top}
+              accent={classColors[top]}
+              sub={`${((probs[top] || 0) * 100).toFixed(0)}% confidence`}
+              valueTransform="capitalize"
+            />
+            <StatCard
+              label="Update"
+              value={ageMs != null ? `${Math.round(ageMs / 1000)}s` : '—'}
+              accent={stale ? T.amber : T.success}
+              sub={stale ? 'Stale' : 'Live · 1 Hz'}
+            />
+          </div>
+
+          {/* Sensor panel */}
+          <LiveSensorPanel telemetry={telemetry}/>
+
+          {/* Sparklines */}
+          <div style={{
+            background: T.canvas,
+            borderRadius: '16px',
+            padding: '18px 22px',
+            border: `1px solid ${T.hairline}`,
+            marginBottom: '16px',
+          }}>
+            <div style={{
+              fontSize: '13px', fontWeight: 600, color: T.textDeep, marginBottom: '14px',
+            }}>
+              Last {history.length}s — class probabilities
+            </div>
+            <div style={{
+              display: 'grid',
+              gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))',
+              gap: '14px',
+            }}>
+              {classes.map((cls) => (
+                <div key={cls}>
+                  <div style={{
+                    display: 'flex', justifyContent: 'space-between',
+                    fontSize: '11px', fontWeight: 600,
+                    color: classColors[cls], textTransform: 'uppercase',
+                    letterSpacing: '0.08em', marginBottom: '6px',
+                  }}>
+                    <span>{cls}</span>
+                    <span style={{ color: T.textMuted, fontVariantNumeric: 'tabular-nums' }}>
+                      {((probs[cls] || 0) * 100).toFixed(0)}%
+                    </span>
+                  </div>
+                  <Sparkline
+                    values={history.map((h) => h[cls])}
+                    color={classColors[cls]}
+                    max={1}
+                  />
+                </div>
+              ))}
+            </div>
+          </div>
+
+          {/* Accelerometer history */}
+          <div style={{
+            background: T.canvas,
+            borderRadius: '16px',
+            padding: '18px 22px',
+            border: `1px solid ${T.hairline}`,
+          }}>
+            <div style={{
+              fontSize: '13px', fontWeight: 600, color: T.textDeep, marginBottom: '14px',
+            }}>
+              Accelerometer RMS — last {history.length}s
+            </div>
+            <div style={{
+              display: 'grid',
+              gridTemplateColumns: '1fr 1fr',
+              gap: '14px',
+            }}>
+              <div>
+                <div style={{
+                  fontSize: '11px', fontWeight: 600, color: T.tealPrimary,
+                  textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: '6px',
+                }}>
+                  Throat (g)
+                </div>
+                <Sparkline
+                  values={history.map((h) => h.throat)}
+                  color={T.tealPrimary}
+                />
+              </div>
+              <div>
+                <div style={{
+                  fontSize: '11px', fontWeight: 600, color: T.amber,
+                  textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: '6px',
+                }}>
+                  Sternum (g)
+                </div>
+                <Sparkline
+                  values={history.map((h) => h.sternum)}
+                  color={T.amber}
+                />
+              </div>
+            </div>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+function StatCard({ label, value, accent, sub, valueTransform }) {
+  return (
+    <div style={{
+      background: T.canvas,
+      borderRadius: '14px',
+      padding: '16px 18px',
+      border: `1px solid ${T.hairline}`,
+      borderLeft: `3px solid ${accent}`,
+    }}>
+      <div style={{
+        fontSize: '11px', fontWeight: 600, color: T.textMuted,
+        letterSpacing: '0.08em', textTransform: 'uppercase',
+      }}>{label}</div>
+      <div style={{
+        fontSize: '26px', fontWeight: 700, color: T.textDeep, marginTop: '6px',
+        fontVariantNumeric: 'tabular-nums',
+        textTransform: valueTransform || 'none',
+      }}>{value}</div>
+      <div style={{ fontSize: '12px', color: accent, fontWeight: 600, marginTop: '2px' }}>
+        {sub}
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
 // COMING SOON PAGE
 // ============================================================
 
@@ -4355,7 +4642,7 @@ export default function App() {
       pageContent = <PatientProfilePage />;
       break;
     case 'Live Monitor':
-      pageContent = <ComingSoonPage title="Live Monitor" icon={icons.activity} />;
+      pageContent = <LiveMonitorPage thresholds={thresholds} />;
       break;
     case 'Reports':
       pageContent = <ReportsPage />;
