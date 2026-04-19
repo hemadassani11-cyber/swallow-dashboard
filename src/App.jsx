@@ -39,11 +39,18 @@ function generateSwallowsForDay(dayOffset = 0) {
 
   const endTime = dayOffset === 0 ? Math.min(now.getTime(), dayEnd.getTime()) : dayEnd.getTime();
 
+  // Subtle 90-day trend: gentle improvement in the most recent days.
+  // dayOffset 0 (today) -> factor 1.0 (baseline).
+  // dayOffset 89 (~90 days ago) -> factor 0.88 (gaps ~14% longer, fewer swallows).
+  const trendFactor = 1 - Math.min(dayOffset, 89) / 90 * 0.12;
+  const gapMultiplier = 1 / trendFactor;
+
   let t = dayStart.getTime();
   while (t < endTime) {
     swallows.push(new Date(t));
     const hour = new Date(t).getHours();
-    t += isSleepHour(hour) ? randomSleepGapMs() : randomWakingGapMs();
+    const rawGap = isSleepHour(hour) ? randomSleepGapMs() : randomWakingGapMs();
+    t += rawGap * gapMultiplier;
   }
   return swallows;
 }
@@ -77,9 +84,9 @@ function generateSOSEvents(swallows) {
   return events;
 }
 
-// 30 days, ordered oldest-to-newest (index 0 = 29 days ago, index 29 = today)
-const thirtyDayDetailedHistory = Array.from({ length: 30 }, (_, i) => {
-  const d = 29 - i;
+// 90 days, ordered oldest-to-newest (index 0 = 89 days ago, index 89 = today)
+const ninetyDayDetailedHistory = Array.from({ length: 90 }, (_, i) => {
+  const d = 89 - i;
   const sws = generateSwallowsForDay(d);
   const nudges = generateNudges(sws);
   const sosEvents = generateSOSEvents(sws);
@@ -88,8 +95,9 @@ const thirtyDayDetailedHistory = Array.from({ length: 30 }, (_, i) => {
   return { date, swallows: sws, nudges, sosEvents };
 });
 
-// Last 7 days, same shape as before: index 6 = today
-const sevenDayDetailedHistory = thirtyDayDetailedHistory.slice(-7);
+// Existing 30-day and 7-day slices (most recent)
+const thirtyDayDetailedHistory = ninetyDayDetailedHistory.slice(-30);
+const sevenDayDetailedHistory = ninetyDayDetailedHistory.slice(-7);
 
 const todaySwallows = sevenDayDetailedHistory[6].swallows;
 const yesterdaySwallows = sevenDayDetailedHistory[5].swallows;
@@ -226,6 +234,7 @@ const T = {
 
 const DEFAULT_THRESHOLDS = { tier1: 60, tier2: 120, tier3: 240, tier4: 420 };
 const THRESHOLDS_STORAGE_KEY = 'chyme.thresholds';
+const CAREGIVER_PHONE_KEY = 'chyme_caregiver_phone';
 
 // ============================================================
 // HELPERS
@@ -1031,9 +1040,23 @@ function CountdownHero({ lastSwallow, secondsSince, tier, thresholds, onReset })
 // SOS EMERGENCY OVERLAY (Tier 4)
 // ============================================================
 
-function SOSOverlay({ secondsSince, calling, onCall, onDismiss }) {
+function SOSOverlay({ secondsSince, onDismiss }) {
   const minutes = Math.floor(secondsSince / 60);
   const seconds = secondsSince % 60;
+
+  // State machine: 'idle' | 'noPhone' | 'pending' | 'success' | 'failure' | 'fake911'
+  const [status, setStatus] = useState('idle');
+  const [errorMsg, setErrorMsg] = useState(null);
+
+  const mountedRef = useRef(true);
+  useEffect(() => () => { mountedRef.current = false; }, []);
+
+  // Auto-dismiss the whole overlay after a hang-time on success or fake 911
+  useEffect(() => {
+    if (status !== 'success' && status !== 'fake911') return;
+    const t = setTimeout(() => { onDismiss(); }, 3000);
+    return () => clearTimeout(t);
+  }, [status, onDismiss]);
 
   const buttonStyle = {
     width: '100%',
@@ -1056,6 +1079,300 @@ function SOSOverlay({ secondsSince, calling, onCall, onDismiss }) {
       <path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7A2 2 0 0 1 22 16.92z"/>
     </svg>
   );
+
+  const readPhone = () => {
+    try { return localStorage.getItem(CAREGIVER_PHONE_KEY) || ''; }
+    catch { return ''; }
+  };
+
+  const handleCaregiver = async (e) => {
+    e.stopPropagation();
+    const phone = readPhone();
+    if (!phone) {
+      setStatus('noPhone');
+      return;
+    }
+    setErrorMsg(null);
+    setStatus('pending');
+    try {
+      const res = await fetch('/api/trigger-sos-call', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ phoneNumber: phone }),
+      });
+      if (!mountedRef.current) return;
+      if (!res.ok) {
+        let detail = `Request failed with status ${res.status}.`;
+        try {
+          const data = await res.json();
+          detail = data.error || detail;
+        } catch {}
+        setErrorMsg(detail);
+        setStatus('failure');
+        return;
+      }
+      setStatus('success');
+    } catch (err) {
+      if (!mountedRef.current) return;
+      setErrorMsg((err && err.message) || 'Network error reaching the server.');
+      setStatus('failure');
+    }
+  };
+
+  const handle911 = (e) => {
+    e.stopPropagation();
+    setStatus('fake911');
+  };
+
+  const handleDismissError = (e) => {
+    e.stopPropagation();
+    setStatus('idle');
+    setErrorMsg(null);
+  };
+
+  const handleDismissNoPhone = (e) => {
+    e.stopPropagation();
+    onDismiss();
+  };
+
+  const secondaryButtonStyle = {
+    padding: '12px 22px',
+    borderRadius: '10px',
+    border: `1px solid ${T.tier4}55`,
+    background: 'transparent',
+    color: T.tier4,
+    fontSize: '14px',
+    fontWeight: 600,
+    cursor: 'pointer',
+    fontFamily: 'inherit',
+  };
+
+  const primaryButtonStyle = {
+    padding: '12px 22px',
+    borderRadius: '10px',
+    border: 'none',
+    background: T.tier4,
+    color: '#fff',
+    fontSize: '14px',
+    fontWeight: 600,
+    cursor: 'pointer',
+    fontFamily: 'inherit',
+  };
+
+  let content;
+  if (status === 'pending' || status === 'fake911') {
+    const headline = status === 'fake911' ? 'Calling 911…' : 'Calling caregiver…';
+    content = (
+      <div style={{ textAlign: 'center', padding: '24px 0' }}>
+        <div style={{
+          fontSize: '11px',
+          color: T.textMuted,
+          letterSpacing: '0.15em',
+          textTransform: 'uppercase',
+          fontWeight: 700,
+          marginBottom: '14px',
+        }}>
+          Connecting
+        </div>
+        <div style={{
+          fontSize: '26px',
+          fontWeight: 700,
+          color: T.textDeep,
+          letterSpacing: '-0.01em',
+          marginBottom: '26px',
+        }}>
+          {headline}
+        </div>
+        <div style={{ display: 'flex', justifyContent: 'center' }}>
+          <div
+            className="chyme-spin"
+            style={{
+              width: '44px',
+              height: '44px',
+              border: `3px solid ${T.tier4}33`,
+              borderTopColor: T.tier4,
+              borderRadius: '50%',
+            }}
+          />
+        </div>
+        {status === 'fake911' && (
+          <div style={{ fontSize: '12px', color: T.textFaint, marginTop: '22px' }}>
+            This dialog will close automatically.
+          </div>
+        )}
+      </div>
+    );
+  } else if (status === 'success') {
+    content = (
+      <div style={{ textAlign: 'center', padding: '24px 0' }}>
+        <div style={{
+          fontSize: '11px',
+          color: T.success,
+          letterSpacing: '0.15em',
+          textTransform: 'uppercase',
+          fontWeight: 700,
+          marginBottom: '14px',
+        }}>
+          Request sent
+        </div>
+        <div style={{
+          fontSize: '26px',
+          fontWeight: 700,
+          color: T.textDeep,
+          letterSpacing: '-0.01em',
+          marginBottom: '10px',
+        }}>
+          Call initiated. Hang tight.
+        </div>
+        <div style={{ fontSize: '12px', color: T.textFaint, marginTop: '18px' }}>
+          This dialog will close automatically.
+        </div>
+      </div>
+    );
+  } else if (status === 'noPhone') {
+    content = (
+      <>
+        <div style={{
+          fontSize: '22px',
+          fontWeight: 700,
+          color: T.textDeep,
+          letterSpacing: '-0.01em',
+          marginBottom: '10px',
+        }}>
+          No caregiver phone set.
+        </div>
+        <div style={{
+          fontSize: '14px',
+          color: T.textMuted,
+          lineHeight: 1.5,
+          marginBottom: '24px',
+        }}>
+          Please add a number in Settings.
+        </div>
+        <button onClick={handleDismissNoPhone} style={primaryButtonStyle}>
+          OK
+        </button>
+      </>
+    );
+  } else if (status === 'failure') {
+    content = (
+      <>
+        <div style={{
+          fontSize: '22px',
+          fontWeight: 700,
+          color: T.textDeep,
+          letterSpacing: '-0.01em',
+          marginBottom: '10px',
+        }}>
+          Call failed. Please try again or call manually.
+        </div>
+        {errorMsg && (
+          <div style={{
+            fontSize: '12px',
+            color: T.textFaint,
+            lineHeight: 1.5,
+            marginBottom: '22px',
+            wordBreak: 'break-word',
+          }}>
+            {errorMsg}
+          </div>
+        )}
+        <button onClick={handleDismissError} style={secondaryButtonStyle}>
+          Close
+        </button>
+      </>
+    );
+  } else {
+    // idle — main emergency screen
+    content = (
+      <>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '22px' }}>
+          <div style={{
+            width: '10px',
+            height: '10px',
+            borderRadius: '50%',
+            background: T.tier4,
+            boxShadow: `0 0 0 4px ${T.tier4}22`,
+          }} />
+          <div style={{
+            fontSize: '12px',
+            fontWeight: 700,
+            color: T.tier4,
+            letterSpacing: '0.18em',
+            textTransform: 'uppercase',
+          }}>
+            Emergency
+          </div>
+        </div>
+
+        <div style={{
+          fontSize: '26px',
+          fontWeight: 700,
+          color: T.textDeep,
+          letterSpacing: '-0.01em',
+          marginBottom: '10px',
+          lineHeight: 1.25,
+        }}>
+          Contact caregiver immediately
+        </div>
+
+        <div style={{
+          fontSize: '14px',
+          color: T.textMuted,
+          lineHeight: 1.6,
+          marginBottom: '28px',
+        }}>
+          Extended inactivity detected. No swallow has been recorded in{' '}
+          <span style={{ color: T.textDeep, fontWeight: 600, fontVariantNumeric: 'tabular-nums' }}>
+            {minutes}m {seconds}s
+          </span>
+          .
+        </div>
+
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
+          <button
+            onClick={handleCaregiver}
+            onMouseEnter={(e) => { e.currentTarget.style.background = T.tier4Dark; }}
+            onMouseLeave={(e) => { e.currentTarget.style.background = T.tier4; }}
+            style={buttonStyle}
+          >
+            {callIcon}
+            <div>
+              <div style={{ fontSize: '16px', fontWeight: 700 }}>Call caregiver</div>
+              <div style={{ fontSize: '13px', fontWeight: 500, opacity: 0.9, marginTop: '2px' }}>
+                Contact the saved caregiver number
+              </div>
+            </div>
+          </button>
+
+          <button
+            onClick={handle911}
+            onMouseEnter={(e) => { e.currentTarget.style.background = T.tier4Dark; }}
+            onMouseLeave={(e) => { e.currentTarget.style.background = T.tier4; }}
+            style={buttonStyle}
+          >
+            {callIcon}
+            <div>
+              <div style={{ fontSize: '16px', fontWeight: 700 }}>Call 911</div>
+              <div style={{ fontSize: '13px', fontWeight: 500, opacity: 0.9, marginTop: '2px' }}>
+                Emergency services
+              </div>
+            </div>
+          </button>
+        </div>
+
+        <div style={{
+          fontSize: '11px',
+          color: T.textFaint,
+          textAlign: 'center',
+          marginTop: '22px',
+          letterSpacing: '0.02em',
+        }}>
+          Tap outside this dialog to dismiss
+        </div>
+      </>
+    );
+  }
 
   return (
     <div
@@ -1086,135 +1403,7 @@ function SOSOverlay({ secondsSince, calling, onCall, onDismiss }) {
           boxShadow: '0 30px 80px rgba(0, 0, 0, 0.4)',
         }}
       >
-        {calling ? (
-          <div style={{ textAlign: 'center', padding: '24px 0' }}>
-            <div style={{
-              fontSize: '11px',
-              color: T.textMuted,
-              letterSpacing: '0.15em',
-              textTransform: 'uppercase',
-              fontWeight: 700,
-              marginBottom: '14px',
-            }}>
-              Connecting
-            </div>
-            <div style={{
-              fontSize: '26px',
-              fontWeight: 700,
-              color: T.textDeep,
-              letterSpacing: '-0.01em',
-              marginBottom: '26px',
-            }}>
-              Calling {calling}…
-            </div>
-            <div style={{ display: 'flex', justifyContent: 'center' }}>
-              <div
-                className="chyme-spin"
-                style={{
-                  width: '44px',
-                  height: '44px',
-                  border: `3px solid ${T.tier4}33`,
-                  borderTopColor: T.tier4,
-                  borderRadius: '50%',
-                }}
-              />
-            </div>
-            <div style={{
-              fontSize: '12px',
-              color: T.textFaint,
-              marginTop: '22px',
-            }}>
-              This dialog will close automatically.
-            </div>
-          </div>
-        ) : (
-          <>
-            <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '22px' }}>
-              <div style={{
-                width: '10px',
-                height: '10px',
-                borderRadius: '50%',
-                background: T.tier4,
-                boxShadow: `0 0 0 4px ${T.tier4}22`,
-              }} />
-              <div style={{
-                fontSize: '12px',
-                fontWeight: 700,
-                color: T.tier4,
-                letterSpacing: '0.18em',
-                textTransform: 'uppercase',
-              }}>
-                Emergency
-              </div>
-            </div>
-
-            <div style={{
-              fontSize: '26px',
-              fontWeight: 700,
-              color: T.textDeep,
-              letterSpacing: '-0.01em',
-              marginBottom: '10px',
-              lineHeight: 1.25,
-            }}>
-              Contact caregiver immediately
-            </div>
-
-            <div style={{
-              fontSize: '14px',
-              color: T.textMuted,
-              lineHeight: 1.6,
-              marginBottom: '28px',
-            }}>
-              Extended inactivity detected. No swallow has been recorded in{' '}
-              <span style={{ color: T.textDeep, fontWeight: 600, fontVariantNumeric: 'tabular-nums' }}>
-                {minutes}m {seconds}s
-              </span>
-              .
-            </div>
-
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
-              <button
-                onClick={(e) => { e.stopPropagation(); onCall('Maria Chen'); }}
-                onMouseEnter={(e) => { e.currentTarget.style.background = T.tier4Dark; }}
-                onMouseLeave={(e) => { e.currentTarget.style.background = T.tier4; }}
-                style={buttonStyle}
-              >
-                {callIcon}
-                <div>
-                  <div style={{ fontSize: '16px', fontWeight: 700 }}>Call Maria Chen</div>
-                  <div style={{ fontSize: '13px', fontWeight: 500, opacity: 0.9, marginTop: '2px', fontVariantNumeric: 'tabular-nums' }}>
-                    (555) 123-4567
-                  </div>
-                </div>
-              </button>
-
-              <button
-                onClick={(e) => { e.stopPropagation(); onCall('911'); }}
-                onMouseEnter={(e) => { e.currentTarget.style.background = T.tier4Dark; }}
-                onMouseLeave={(e) => { e.currentTarget.style.background = T.tier4; }}
-                style={buttonStyle}
-              >
-                {callIcon}
-                <div>
-                  <div style={{ fontSize: '16px', fontWeight: 700 }}>Call 911</div>
-                  <div style={{ fontSize: '13px', fontWeight: 500, opacity: 0.9, marginTop: '2px' }}>
-                    Emergency services
-                  </div>
-                </div>
-              </button>
-            </div>
-
-            <div style={{
-              fontSize: '11px',
-              color: T.textFaint,
-              textAlign: 'center',
-              marginTop: '22px',
-              letterSpacing: '0.02em',
-            }}>
-              Tap outside this dialog to dismiss
-            </div>
-          </>
-        )}
+        {content}
       </div>
     </div>
   );
@@ -1952,16 +2141,6 @@ function OverviewPage({ thresholds }) {
 
   const handleReset = () => setLastSwallowOverride(new Date());
 
-  const [calling, setCalling] = useState(null);
-  useEffect(() => {
-    if (!calling) return;
-    const t = setTimeout(() => {
-      setCalling(null);
-      setLastSwallowOverride(new Date());
-    }, 3000);
-    return () => clearTimeout(t);
-  }, [calling]);
-
   const hourOfDay = new Date().getHours();
   const expectedByNow = Math.round((yesterdaySwallows.length * hourOfDay) / 24);
   const delta = todaySwallows.length - expectedByNow;
@@ -2065,8 +2244,6 @@ function OverviewPage({ thresholds }) {
       {tier >= 4 && (
         <SOSOverlay
           secondsSince={secondsSince}
-          calling={calling}
-          onCall={setCalling}
           onDismiss={handleReset}
         />
       )}
@@ -2833,11 +3010,14 @@ function PatientProfilePage() {
 // REPORTS PAGE, clinician-facing
 // ============================================================
 
-function DailyCountLineChart({ data, avg }) {
-  const W = 760, H = 260;
-  const PL = 48, PR = 32, PT = 24, PB = 40;
-  const innerW = W - PL - PR;
+function DailyCountLineChart({ data, onVisibleAvgChange }) {
+  const DAY_WIDTH = 22;
+  const WINDOW_DAYS = 30;
+  const H = 260;
+  const PT = 24, PB = 40;
   const innerH = H - PT - PB;
+
+  const chartW = data.length * DAY_WIDTH;
 
   const counts = data.map((d) => d.count);
   const maxRaw = Math.max(...counts, 1);
@@ -2846,84 +3026,232 @@ function DailyCountLineChart({ data, avg }) {
   const tickValues = [];
   for (let v = 0; v <= maxY; v += step) tickValues.push(v);
 
-  const x = (i) => PL + (i / Math.max(data.length - 1, 1)) * innerW;
-  const y = (v) => PT + innerH - (v / maxY) * innerH;
+  const xAt = (i) => i * DAY_WIDTH + DAY_WIDTH / 2;
+  const yAt = (v) => PT + innerH - (v / maxY) * innerH;
 
-  const linePoints = data.map((d, i) => `${x(i)},${y(d.count)}`).join(' ');
-  const areaPoints = `${x(0)},${PT + innerH} ${linePoints} ${x(data.length - 1)},${PT + innerH}`;
+  const linePoints = data.map((d, i) => `${xAt(i)},${yAt(d.count)}`).join(' ');
+  const areaPoints = `${xAt(0)},${PT + innerH} ${linePoints} ${xAt(data.length - 1)},${PT + innerH}`;
+
+  const scrollRef = useRef(null);
+  const [visible, setVisible] = useState({
+    start: Math.max(0, data.length - WINDOW_DAYS),
+    end: data.length,
+    avg: 0,
+  });
+  const [hovered, setHovered] = useState(null);
+
+  const updateVisible = () => {
+    if (!scrollRef.current) return;
+    const { scrollLeft, clientWidth } = scrollRef.current;
+    const start = Math.max(0, Math.floor(scrollLeft / DAY_WIDTH));
+    const end = Math.min(data.length, Math.ceil((scrollLeft + clientWidth) / DAY_WIDTH));
+    const slice = data.slice(start, end);
+    const a = slice.length ? slice.reduce((s, d) => s + d.count, 0) / slice.length : 0;
+    setVisible({ start, end, avg: a });
+  };
+
+  useEffect(() => {
+    if (!scrollRef.current) return;
+    // default to rightmost (most recent)
+    scrollRef.current.scrollLeft = scrollRef.current.scrollWidth;
+    updateVisible();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    onVisibleAvgChange?.(visible.avg);
+  }, [visible.avg, onVisibleAvgChange]);
+
+  const scrollBy = (days) => {
+    if (!scrollRef.current) return;
+    scrollRef.current.scrollBy({ left: days * DAY_WIDTH, behavior: 'smooth' });
+  };
+
+  const visibleStartX = visible.start * DAY_WIDTH;
+  const visibleEndX = visible.end * DAY_WIDTH;
+
+  const navButtonStyle = {
+    width: '32px',
+    flexShrink: 0,
+    alignSelf: 'stretch',
+    border: `1px solid ${T.hairline}`,
+    background: T.canvas,
+    color: T.textBody,
+    borderRadius: '8px',
+    cursor: 'pointer',
+    fontSize: '14px',
+    fontFamily: 'inherit',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+  };
 
   return (
-    <svg viewBox={`0 0 ${W} ${H}`} width="100%" style={{ display: 'block' }}>
-      <defs>
-        <linearGradient id="dailyCountArea" x1="0" y1="0" x2="0" y2="1">
-          <stop offset="0%" stopColor={T.tealSoft} stopOpacity="0.32" />
-          <stop offset="100%" stopColor={T.tealSoft} stopOpacity="0" />
-        </linearGradient>
-      </defs>
-
-      {tickValues.map((v, i) => (
-        <line
-          key={`gl-${i}`}
-          x1={PL}
-          x2={PL + innerW}
-          y1={y(v)}
-          y2={y(v)}
-          stroke={T.hairlineSoft}
-          strokeWidth="1"
-        />
-      ))}
-      {tickValues.map((v, i) => (
-        <text
-          key={`yt-${i}`}
-          x={PL - 10}
-          y={y(v) + 4}
-          textAnchor="end"
-          fontSize="11"
-          fill={T.textMuted}
-        >
-          {v}
-        </text>
-      ))}
-
-      <polygon points={areaPoints} fill="url(#dailyCountArea)" />
-      <polyline
-        points={linePoints}
-        fill="none"
-        stroke={T.tealPrimary}
-        strokeWidth="2.2"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-      />
-
-      {data.map((d, i) => (
-        <circle key={i} cx={x(i)} cy={y(d.count)} r="2.4" fill={T.tealPrimary} />
-      ))}
-
-      <line
-        x1={PL}
-        x2={PL + innerW}
-        y1={y(avg)}
-        y2={y(avg)}
-        stroke={T.coral}
-        strokeWidth="1.5"
-        strokeDasharray="5 4"
-      />
-      {data.map((d, i) => {
-        if (i % 5 !== 0 && i !== data.length - 1) return null;
-        return (
+    <div style={{ display: 'flex', alignItems: 'stretch', gap: '6px' }}>
+      {/* Fixed Y-axis column */}
+      <svg width="44" height={H} style={{ display: 'block', flexShrink: 0, overflow: 'visible' }}>
+        {tickValues.map((v, i) => (
           <text
-            key={i}
-            x={x(i)}
-            y={PT + innerH + 22}
-            textAnchor="middle"
+            key={`yt-${i}`}
+            x={40}
+            y={yAt(v) + 4}
+            textAnchor="end"
             fontSize="11"
             fill={T.textMuted}
           >
-            {d.date.toLocaleDateString([], { month: 'short', day: 'numeric' })}
+            {v}
           </text>
-        );
-      })}
-    </svg>
+        ))}
+      </svg>
+
+      {/* Older button */}
+      <button
+        onClick={() => scrollBy(-15)}
+        onMouseEnter={(e) => { e.currentTarget.style.background = T.tealTint; }}
+        onMouseLeave={(e) => { e.currentTarget.style.background = T.canvas; }}
+        aria-label="Scroll to older data"
+        style={navButtonStyle}
+      >
+        ‹
+      </button>
+
+      {/* Scrollable chart area */}
+      <div
+        ref={scrollRef}
+        onScroll={updateVisible}
+        style={{
+          flex: 1,
+          minWidth: 0,
+          overflowX: 'auto',
+          overflowY: 'hidden',
+          position: 'relative',
+        }}
+      >
+        <div style={{ position: 'relative', width: `${chartW}px`, height: `${H}px` }}>
+          <svg viewBox={`0 0 ${chartW} ${H}`} width={chartW} height={H} style={{ display: 'block' }}>
+            <defs>
+              <linearGradient id="dailyCountArea" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stopColor={T.tealSoft} stopOpacity="0.32" />
+                <stop offset="100%" stopColor={T.tealSoft} stopOpacity="0" />
+              </linearGradient>
+            </defs>
+
+            {/* Gridlines (inside scroll area so they span full chart) */}
+            {tickValues.map((v, i) => (
+              <line
+                key={`gl-${i}`}
+                x1={0}
+                x2={chartW}
+                y1={yAt(v)}
+                y2={yAt(v)}
+                stroke={T.hairlineSoft}
+                strokeWidth="1"
+              />
+            ))}
+
+            <polygon points={areaPoints} fill="url(#dailyCountArea)" />
+            <polyline
+              points={linePoints}
+              fill="none"
+              stroke={T.tealPrimary}
+              strokeWidth="2.2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            />
+
+            {data.map((d, i) => (
+              <circle
+                key={i}
+                cx={xAt(i)}
+                cy={yAt(d.count)}
+                r="3"
+                fill={T.tealPrimary}
+                style={{ cursor: 'pointer' }}
+                onMouseEnter={() => setHovered({ i, date: d.date, count: d.count, x: xAt(i), y: yAt(d.count) })}
+                onMouseLeave={() => setHovered(null)}
+              />
+            ))}
+
+            {/* Dashed average line, only over visible window */}
+            {visible.end > visible.start && (
+              <line
+                x1={visibleStartX}
+                x2={visibleEndX}
+                y1={yAt(visible.avg)}
+                y2={yAt(visible.avg)}
+                stroke={T.coral}
+                strokeWidth="1.5"
+                strokeDasharray="5 4"
+              />
+            )}
+
+            {/* X-axis labels every 10 days */}
+            {data.map((d, i) => {
+              if (i % 10 !== 0 && i !== data.length - 1) return null;
+              return (
+                <text
+                  key={`xl-${i}`}
+                  x={xAt(i)}
+                  y={PT + innerH + 22}
+                  textAnchor="middle"
+                  fontSize="11"
+                  fill={T.textMuted}
+                >
+                  {d.date.toLocaleDateString([], { month: 'short', day: 'numeric' })}
+                </text>
+              );
+            })}
+          </svg>
+
+          {/* Tooltip on hovered point */}
+          {hovered && (
+            <div style={{
+              position: 'absolute',
+              left: `${hovered.x}px`,
+              top: `${hovered.y - 10}px`,
+              transform: 'translate(-50%, -100%)',
+              pointerEvents: 'none',
+              zIndex: 10,
+            }}>
+              <div style={{
+                background: T.textDeep,
+                color: '#fff',
+                padding: '7px 11px',
+                borderRadius: '6px',
+                fontSize: '11.5px',
+                fontWeight: 500,
+                whiteSpace: 'nowrap',
+                letterSpacing: '0.01em',
+                boxShadow: '0 6px 20px rgba(0,0,0,0.28)',
+              }}>
+                {hovered.date.toLocaleDateString([], { month: 'short', day: 'numeric', year: 'numeric' })}: {hovered.count} swallows
+              </div>
+              <div style={{
+                position: 'absolute',
+                left: '50%',
+                bottom: '-5px',
+                transform: 'translateX(-50%)',
+                width: 0, height: 0,
+                borderLeft: '5px solid transparent',
+                borderRight: '5px solid transparent',
+                borderTop: `5px solid ${T.textDeep}`,
+              }} />
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* Newer button */}
+      <button
+        onClick={() => scrollBy(15)}
+        onMouseEnter={(e) => { e.currentTarget.style.background = T.tealTint; }}
+        onMouseLeave={(e) => { e.currentTarget.style.background = T.canvas; }}
+        aria-label="Scroll to newer data"
+        style={navButtonStyle}
+      >
+        ›
+      </button>
+    </div>
   );
 }
 
@@ -3087,13 +3415,10 @@ function ReportsPage() {
   const [downloadError, setDownloadError] = useState(null);
 
   const lineData = useMemo(
-    () => thirtyDayDetailedHistory.map((d) => ({ date: d.date, count: d.swallows.length })),
+    () => ninetyDayDetailedHistory.map((d) => ({ date: d.date, count: d.swallows.length })),
     []
   );
-  const avg = useMemo(
-    () => lineData.reduce((s, d) => s + d.count, 0) / Math.max(lineData.length, 1),
-    [lineData]
-  );
+  const [visibleAvg, setVisibleAvg] = useState(0);
 
   const startDate = thirtyDayDetailedHistory[0].date;
   const endDate = thirtyDayDetailedHistory[thirtyDayDetailedHistory.length - 1].date;
@@ -3191,13 +3516,13 @@ function ReportsPage() {
               Daily swallow count
             </div>
             <div style={{ fontSize: '12px', color: T.textMuted, whiteSpace: 'nowrap' }}>
-              30-day average: {Math.round(avg)} swallows/day
+              30-day window average: {Math.round(visibleAvg)} swallows/day
             </div>
           </div>
           <div style={{ fontSize: '12px', color: T.textMuted, marginBottom: '14px' }}>
-            Past 30 days. Dashed line shows the 30-day average.
+            Past 90 days. Scroll horizontally to see up to 90 days of history. Dashed line shows the visible window average.
           </div>
-          <DailyCountLineChart data={lineData} avg={avg} />
+          <DailyCountLineChart data={lineData} onVisibleAvgChange={setVisibleAvg} />
         </div>
 
         {/* 3. Histogram */}
@@ -3560,6 +3885,152 @@ function SettingsPage({ thresholds, setThresholds }) {
             </div>
           )}
         </div>
+      </div>
+
+      <EmergencyContactSection />
+    </div>
+  );
+}
+
+function EmergencyContactSection() {
+  const [phone, setPhone] = useState(() => {
+    try { return localStorage.getItem(CAREGIVER_PHONE_KEY) || ''; }
+    catch { return ''; }
+  });
+  const [status, setStatus] = useState(null);
+
+  const E164 = /^\+[1-9]\d{7,14}$/;
+
+  const handleSave = () => {
+    const trimmed = phone.trim();
+    if (trimmed && !E164.test(trimmed)) {
+      setStatus({ type: 'error', message: 'Use E.164 format like "+15551234567".' });
+      return;
+    }
+    try {
+      if (trimmed) localStorage.setItem(CAREGIVER_PHONE_KEY, trimmed);
+      else localStorage.removeItem(CAREGIVER_PHONE_KEY);
+      setPhone(trimmed);
+      setStatus({ type: 'success', message: 'Saved.' });
+      setTimeout(() => setStatus(null), 2000);
+    } catch {
+      setStatus({ type: 'error', message: 'Could not save to this browser.' });
+    }
+  };
+
+  return (
+    <div style={{
+      background: T.canvas,
+      borderRadius: '16px',
+      border: `1px solid ${T.hairline}`,
+      padding: '24px',
+    }}>
+      <div style={{ marginBottom: '4px' }}>
+        <SectionLabel>Emergency contact</SectionLabel>
+      </div>
+      <div style={{
+        fontSize: '13px',
+        color: T.textMuted,
+        marginBottom: '16px',
+        lineHeight: 1.5,
+      }}>
+        This number will be called automatically when Tier 4 SOS triggers.
+        Use international format with country code.
+      </div>
+
+      <div style={{
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'space-between',
+        padding: '14px 0',
+        borderBottom: `1px solid ${T.hairlineSoft}`,
+        gap: '16px',
+        textAlign: 'left',
+      }}>
+        <div style={{
+          flex: 1,
+          minWidth: 0,
+          display: 'flex',
+          flexDirection: 'column',
+          alignItems: 'flex-start',
+        }}>
+          <div style={{
+            fontSize: '14px',
+            fontWeight: 600,
+            color: T.textDeep,
+            textAlign: 'left',
+            width: '100%',
+          }}>
+            Caregiver phone number
+          </div>
+          <div style={{
+            fontSize: '12px',
+            color: T.textMuted,
+            marginTop: '2px',
+            textAlign: 'left',
+            width: '100%',
+          }}>
+            E.164 format, e.g. +15551234567
+          </div>
+        </div>
+        <input
+          type="tel"
+          value={phone}
+          onChange={(e) => { setPhone(e.target.value); setStatus(null); }}
+          placeholder="+15551234567"
+          style={{
+            width: '200px',
+            padding: '9px 12px',
+            borderRadius: '8px',
+            border: `1px solid ${T.hairline}`,
+            fontSize: '14px',
+            fontFamily: 'inherit',
+            color: T.textDeep,
+            fontVariantNumeric: 'tabular-nums',
+            background: T.canvas,
+            outline: 'none',
+          }}
+          onFocus={(e) => { e.currentTarget.style.borderColor = T.tealPrimary; }}
+          onBlur={(e) => { e.currentTarget.style.borderColor = T.hairline; }}
+        />
+      </div>
+
+      <div style={{
+        display: 'flex',
+        alignItems: 'center',
+        gap: '12px',
+        marginTop: '22px',
+        flexWrap: 'wrap',
+      }}>
+        <button
+          onClick={handleSave}
+          style={{
+            height: '40px',
+            padding: '0 22px',
+            borderRadius: '10px',
+            border: 'none',
+            background: T.tealPrimary,
+            color: '#fff',
+            fontSize: '13px',
+            fontWeight: 600,
+            cursor: 'pointer',
+            fontFamily: 'inherit',
+          }}
+        >
+          Save
+        </button>
+        {status && (
+          <div style={{
+            fontSize: '13px',
+            fontWeight: 500,
+            color: status.type === 'error' ? T.coral : T.success,
+            padding: '6px 12px',
+            borderRadius: '8px',
+            background: status.type === 'error' ? T.coralWash : T.successWash,
+          }}>
+            {status.message}
+          </div>
+        )}
       </div>
     </div>
   );
