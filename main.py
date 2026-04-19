@@ -104,6 +104,7 @@ def update_state(**kwargs):
 
 def snapshot_state():
     with _state_lock:
+        # deep copy the dict inside probs so the publisher doesn't mutate it
         snap = dict(_state)
         snap["probs"] = dict(snap["probs"])
         return snap
@@ -145,7 +146,7 @@ def rec_stop():
         print("[rec] STOP — empty buffer, nothing saved", flush=True)
         return None
     ts = time.strftime("%Y%m%d_%H%M%S")
-    filename = f"{label}.{ts}.csv"
+    filename = f"{label}.{ts}.csv"                    # dot format for EI auto-labeling
     filepath = os.path.join(RECORDINGS_DIR, filename)
     try:
         with open(filepath, "w") as f:
@@ -171,6 +172,7 @@ def rec_add_sample(s):
         _rec_buffer.append((rel_ms,
                             s["t_ax"], s["t_ay"], s["t_az"],
                             s["s_ax"], s["s_ay"], s["s_az"]))
+        # Auto-stop when duration elapsed
         if _rec_duration_s > 0 and rel_ms >= _rec_duration_s * 1000:
             need_stop = True
         else:
@@ -253,6 +255,7 @@ def upload_model(raw_bytes):
     except Exception as e:
         return {"ok": False, "error": f"Failed to write staging file: {e}"}
 
+    # Validate the uploaded .eim by trying to load it in a throwaway runner
     try:
         test_runner = ImpulseRunner(staging)
         info = test_runner.init()
@@ -263,6 +266,7 @@ def upload_model(raw_bytes):
         except Exception: pass
         return {"ok": False, "error": f"Model validation failed: {e}"}
 
+    # Backup current model, then swap in the new one
     try:
         if os.path.exists(MODEL_PATH):
             shutil.copy(MODEL_PATH, MODEL_BACKUP)
@@ -271,6 +275,7 @@ def upload_model(raw_bytes):
     except Exception as e:
         return {"ok": False, "error": f"Failed to swap model file: {e}"}
 
+    # Signal inference loop to reload
     with _model_lock:
         _model_needs_reload = True
 
@@ -418,13 +423,13 @@ RECORDER_HTML = r"""<!doctype html>
 </style></head>
 <body><div class="wrap">
 
-<h1>ChYme Device Console</h1>
-<div class="sub">Local UI for your ChYme device. Training-data recorder, model upload, live status.</div>
+<h1>🎙️ ChYme Device Console</h1>
+<div class="sub">Local UI for your ChYme device. Training-data recorder · model upload · live status.</div>
 
 <div class="tabs">
-  <div class="tab active" data-page="record">Record</div>
-  <div class="tab" data-page="model">Model</div>
-  <div class="tab" data-page="status">Live status</div>
+  <div class="tab active" data-page="record">📼 Record</div>
+  <div class="tab" data-page="model">🧠 Model</div>
+  <div class="tab" data-page="status">📡 Live status</div>
 </div>
 
 <!-- RECORD PAGE -->
@@ -432,10 +437,10 @@ RECORDER_HTML = r"""<!doctype html>
   <div class="card">
     <label>Label</label>
     <div class="chips" id="labels">
-      <button class="chip active" data-val="swallow">swallow</button>
-      <button class="chip" data-val="idle">idle</button>
-      <button class="chip" data-val="cough">cough</button>
-      <button class="chip" data-val="speech">speech</button>
+      <button class="chip active" data-val="swallow">🫗 swallow</button>
+      <button class="chip" data-val="idle">💤 idle</button>
+      <button class="chip" data-val="cough">😮 cough</button>
+      <button class="chip" data-val="speech">💬 speech</button>
     </div>
     <label>Duration</label>
     <div class="chips" id="durations">
@@ -445,43 +450,43 @@ RECORDER_HTML = r"""<!doctype html>
       <button class="chip" data-val="30">30s</button>
       <button class="chip" data-val="0">manual stop</button>
     </div>
-    <button id="record" class="big-btn">Start Recording</button>
+    <button id="record" class="big-btn">● Start Recording</button>
     <div class="progress-wrap"><div id="progress" class="progress"></div></div>
     <div class="status">
-      <div class="row"><span><span class="dot dot-ok"></span>Sensor stream</span><span class="val" id="s-stream">checking</span></div>
+      <div class="row"><span><span class="dot dot-ok"></span>Sensor stream</span><span class="val" id="s-stream">checking…</span></div>
       <div class="row"><span>Status</span><span class="val" id="s-state">idle</span></div>
       <div class="row"><span>Samples captured</span><span class="val" id="s-samples">0</span></div>
       <div class="row"><span>Elapsed</span><span class="val" id="s-elapsed">0.00s</span></div>
-      <div class="row"><span>Last saved</span><span class="val" id="s-last">-</span></div>
+      <div class="row"><span>Last saved</span><span class="val" id="s-last">—</span></div>
     </div>
   </div>
   <div class="card">
     <h2>Recordings on device</h2>
-    <div class="recordings" id="recordings"><div class="empty">Loading...</div></div>
+    <div class="recordings" id="recordings"><div class="empty">Loading…</div></div>
   </div>
 </div>
 
 <!-- MODEL PAGE -->
 <div class="page" id="page-model">
   <div class="card">
-    <h2>Current model</h2>
+    <h2>🧠 Current model</h2>
     <div class="status">
-      <div class="row"><span>Status</span><span class="val" id="m-status">checking</span></div>
-      <div class="row"><span>Labels</span><span class="val" id="m-labels">-</span></div>
-      <div class="row"><span>File size</span><span class="val" id="m-size">-</span></div>
-      <div class="row"><span>Path</span><span class="val" id="m-path">-</span></div>
+      <div class="row"><span>Status</span><span class="val" id="m-status">checking…</span></div>
+      <div class="row"><span>Labels</span><span class="val" id="m-labels">—</span></div>
+      <div class="row"><span>File size</span><span class="val" id="m-size">—</span></div>
+      <div class="row"><span>Path</span><span class="val" id="m-path">—</span></div>
     </div>
   </div>
   <div class="card">
-    <h2>Upload new .eim</h2>
+    <h2>⬆ Upload new .eim</h2>
     <p style="color:#a2b6af;font-size:13px;margin:0 0 14px">
       Replace the running model with a new Edge Impulse deployment (Linux AARCH64 .eim file).
-      The model is validated before swap. If it can't load, the current one stays.
+      The model is validated before swap — if it can't load, the current one stays.
       Hot-swap: no container restart required.
     </p>
     <input type="file" id="model-file" accept=".eim" style="display:none" onchange="uploadModel()">
     <button class="big-btn secondary" onclick="document.getElementById('model-file').click()">
-      Choose .eim file to upload
+      ⬆ Choose .eim file to upload
     </button>
     <div id="upload-banner" class="banner"></div>
     <div class="progress-wrap" style="margin-top:12px"><div id="upload-progress" class="progress"></div></div>
@@ -491,32 +496,32 @@ RECORDER_HTML = r"""<!doctype html>
 <!-- LIVE STATUS PAGE -->
 <div class="page" id="page-status">
   <div class="card">
-    <h2>Live inference</h2>
+    <h2>📡 Live inference</h2>
     <div class="status">
-      <div class="row"><span>Top class</span><span class="val" id="l-top">-</span></div>
-      <div class="row"><span>swallow</span><span class="val" id="l-swallow">-</span></div>
-      <div class="row"><span>idle</span><span class="val" id="l-idle">-</span></div>
-      <div class="row"><span>cough</span><span class="val" id="l-cough">-</span></div>
-      <div class="row"><span>speech</span><span class="val" id="l-speech">-</span></div>
+      <div class="row"><span>Top class</span><span class="val" id="l-top">—</span></div>
+      <div class="row"><span>swallow</span><span class="val" id="l-swallow">—</span></div>
+      <div class="row"><span>idle</span><span class="val" id="l-idle">—</span></div>
+      <div class="row"><span>cough</span><span class="val" id="l-cough">—</span></div>
+      <div class="row"><span>speech</span><span class="val" id="l-speech">—</span></div>
     </div>
   </div>
   <div class="card">
-    <h2>Alert state</h2>
+    <h2>🫀 Alert state</h2>
     <div class="status">
-      <div class="row"><span>Idle seconds</span><span class="val" id="l-idle_s">-</span></div>
-      <div class="row"><span>Alert level (0-3)</span><span class="val" id="l-tier">-</span></div>
-      <div class="row"><span>Swallow count</span><span class="val" id="l-count">-</span></div>
-      <div class="row"><span>Uptime</span><span class="val" id="l-uptime">-</span></div>
+      <div class="row"><span>Idle seconds</span><span class="val" id="l-idle_s">—</span></div>
+      <div class="row"><span>Alert level (0-3)</span><span class="val" id="l-tier">—</span></div>
+      <div class="row"><span>Swallow count</span><span class="val" id="l-count">—</span></div>
+      <div class="row"><span>Uptime</span><span class="val" id="l-uptime">—</span></div>
     </div>
   </div>
   <div class="card">
-    <h2>Sensors</h2>
+    <h2>🔧 Sensors</h2>
     <div class="status">
-      <div class="row"><span>Throat MPU (0x68)</span><span class="val" id="l-throat">-</span></div>
-      <div class="row"><span>Sternum MPU (0x69)</span><span class="val" id="l-sternum">-</span></div>
-      <div class="row"><span>T/S ratio</span><span class="val" id="l-ratio">-</span></div>
-      <div class="row"><span>Throat RMS (g)</span><span class="val" id="l-trms">-</span></div>
-      <div class="row"><span>Sternum RMS (g)</span><span class="val" id="l-srms">-</span></div>
+      <div class="row"><span>Throat MPU (0x68)</span><span class="val" id="l-throat">—</span></div>
+      <div class="row"><span>Sternum MPU (0x69)</span><span class="val" id="l-sternum">—</span></div>
+      <div class="row"><span>T/S ratio</span><span class="val" id="l-ratio">—</span></div>
+      <div class="row"><span>Throat RMS (g)</span><span class="val" id="l-trms">—</span></div>
+      <div class="row"><span>Sternum RMS (g)</span><span class="val" id="l-srms">—</span></div>
     </div>
   </div>
 </div>
@@ -527,6 +532,7 @@ const $ = (id) => document.getElementById(id);
 let selLabel = "swallow", selDuration = 5, isRecording = false;
 let lastSampleCount = 0, lastSampleAt = 0;
 
+// Tab switching
 document.querySelectorAll('.tab').forEach(t => {
   t.onclick = () => {
     document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
@@ -557,12 +563,12 @@ $('record').onclick = async () => {
     });
     if (!r.ok) { alert('Start failed'); return; }
     isRecording = true;
-    $('record').textContent = 'Stop Recording';
+    $('record').textContent = '■ Stop Recording';
     $('record').classList.add('recording');
   } else {
     await fetch('/record/stop', {method: 'POST'});
     isRecording = false;
-    $('record').textContent = 'Start Recording';
+    $('record').textContent = '● Start Recording';
     $('record').classList.remove('recording');
     await refreshRecordings();
   }
@@ -576,14 +582,14 @@ async function refreshRecStatus() {
     $('s-state').textContent   = d.active ? `recording "${d.label}"` : 'idle';
     $('s-samples').textContent = d.samples;
     $('s-elapsed').textContent = (d.elapsed_ms / 1000).toFixed(2) + 's';
-    $('s-last').textContent    = d.last_file || '-';
+    $('s-last').textContent    = d.last_file || '—';
     if (d.active) {
       if (d.samples > lastSampleCount) {
-        $('s-stream').textContent = 'live (' + Math.round((d.samples-lastSampleCount)*5) + ' Hz)';
+        $('s-stream').textContent = '● live (' + Math.round((d.samples-lastSampleCount)*5) + ' Hz)';
         $('s-stream').style.color = '#41b896';
         lastSampleCount = d.samples; lastSampleAt = Date.now();
       } else if (Date.now() - lastSampleAt > 1000) {
-        $('s-stream').textContent = 'stalled'; $('s-stream').style.color = '#d64545';
+        $('s-stream').textContent = '● stalled'; $('s-stream').style.color = '#d64545';
       }
     } else {
       $('s-stream').textContent = 'ready'; $('s-stream').style.color = '#a2b6af';
@@ -596,7 +602,7 @@ async function refreshRecStatus() {
     }
     if (!d.active && isRecording) {
       isRecording = false;
-      $('record').textContent = 'Start Recording';
+      $('record').textContent = '● Start Recording';
       $('record').classList.remove('recording');
       await refreshRecordings();
     }
@@ -627,7 +633,7 @@ async function refreshRecordings() {
             <div class="rec-meta">${f.size_kb} KB</div>
           </div>
         </div>
-        <a href="/recordings/${encodeURIComponent(f.name)}" download>download</a>
+        <a href="/recordings/${encodeURIComponent(f.name)}" download>⬇</a>
       </div>`;
     }).join('');
     el.innerHTML = `<div class="counts">${pills}</div>${rows}`;
@@ -638,12 +644,12 @@ async function refreshModelInfo() {
   try {
     const r = await fetch('/model/info');
     const d = await r.json();
-    $('m-status').textContent = d.loaded ? 'loaded and running inference'
-                                         : d.exists ? 'file present, not loaded'
-                                         : 'no model on device';
+    $('m-status').textContent = d.loaded ? '● loaded & running inference'
+                                         : d.exists ? '● file present, not loaded'
+                                         : '● no model on device';
     $('m-status').style.color = d.loaded ? '#41b896' : d.exists ? '#e0a836' : '#d64545';
-    $('m-labels').textContent = d.labels.length ? d.labels.join(', ') : '-';
-    $('m-size').textContent   = d.size_mb ? d.size_mb + ' MB' : '-';
+    $('m-labels').textContent = d.labels.length ? d.labels.join(', ') : '—';
+    $('m-size').textContent   = d.size_mb ? d.size_mb + ' MB' : '—';
     $('m-path').textContent   = d.path;
   } catch {}
 }
@@ -669,15 +675,15 @@ async function uploadModel() {
     const data = await r.json();
     if (data.ok) {
       banner.className = 'banner show';
-      banner.textContent = `OK - ${data.message}  Labels: ${data.labels.join(', ')}`;
+      banner.textContent = `✓ ${data.message}  Labels: ${data.labels.join(', ')}`;
       setTimeout(refreshModelInfo, 2000);
     } else {
       banner.className = 'banner err show';
-      banner.textContent = `FAIL - ${data.error}`;
+      banner.textContent = `✗ ${data.error}`;
     }
   } catch (e) {
     banner.className = 'banner err show';
-    banner.textContent = `Upload failed: ${e.message}`;
+    banner.textContent = `✗ Upload failed: ${e.message}`;
   }
   input.value = '';
   setTimeout(() => { $('upload-progress').style.width = '0%'; }, 2500);
@@ -699,9 +705,9 @@ async function refreshLiveStatus() {
     $('l-count').textContent  = d.swallow_count;
     $('l-uptime').textContent = Math.floor(d.uptime_s/60) + 'm ' + (d.uptime_s%60) + 's';
     const mpu = d.mpu_status || 0;
-    $('l-throat').textContent  = (mpu & 1) ? 'streaming' : 'not detected';
+    $('l-throat').textContent  = (mpu & 1) ? '● streaming' : '● not detected';
     $('l-throat').style.color  = (mpu & 1) ? '#41b896' : '#d64545';
-    $('l-sternum').textContent = (mpu & 2) ? 'streaming' : 'not detected';
+    $('l-sternum').textContent = (mpu & 2) ? '● streaming' : '● not detected';
     $('l-sternum').style.color = (mpu & 2) ? '#41b896' : '#d64545';
     $('l-ratio').textContent   = (d.ratio || 0).toFixed(2);
     $('l-trms').textContent    = (d.throat_rms || 0).toFixed(3);
@@ -760,6 +766,7 @@ class Handler(BaseHTTPRequestHandler):
     def _read_bytes(self):
         ln = int(self.headers.get("Content-Length", "0"))
         if ln <= 0: return b""
+        # Read in chunks for large uploads
         chunks = []
         remaining = ln
         while remaining > 0:
@@ -863,10 +870,10 @@ def init_mpus_forever():
 def load_model_once():
     """Try to load .eim once. Returns runner or None."""
     if not HAVE_EI:
-        print("[model] edge_impulse_linux not installed - recorder-only mode", flush=True)
+        print("[model] edge_impulse_linux not installed — recorder-only mode", flush=True)
         return None
     if not os.path.exists(MODEL_PATH):
-        print(f"[model] {MODEL_PATH} not found - recorder-only mode until uploaded", flush=True)
+        print(f"[model] {MODEL_PATH} not found — recorder-only mode until uploaded", flush=True)
         return None
     try:
         r = ImpulseRunner(MODEL_PATH)
@@ -933,6 +940,7 @@ def inference_loop():
         now = time.time()
         idle = int(now - last_swallow)
 
+        # --- 0. Handle model hot-swap ---
         with _model_lock:
             should_reload = _model_needs_reload
             _model_needs_reload = False
@@ -946,6 +954,7 @@ def inference_loop():
             runner = load_model_once()
             window.clear()
 
+        # --- 1. Sample sensor ---
         try:
             line = Bridge.call("mpu_read")
             s = parse_mpu_line(line)
@@ -960,10 +969,11 @@ def inference_loop():
             if mpu_err_count % 100 == 1:
                 print(f"[loop] mpu_read err: {e}", flush=True)
         if mpu_err_count > MPU_ERR_RESET:
-            print("[loop] too many MPU errors - re-initializing", flush=True)
+            print("[loop] too many MPU errors — re-initializing", flush=True)
             init_mpus_forever()
             mpu_err_count = 0
 
+        # --- 2. Inference ---
         latest_probs = dict(_state.get("probs", {}))
         if runner is not None and len(window) == WINDOW_SAMPLES and (now - last_infer) >= INFERENCE_EVERY_S:
             last_infer = now
@@ -972,12 +982,13 @@ def inference_loop():
                 latest_probs = r["result"]["classification"]
                 top = max(latest_probs.items(), key=lambda kv: kv[1])
 
+                # Swallow detection with cooldown
                 if (latest_probs.get("swallow", 0) >= SWALLOW_THRESH
                         and (now - last_swallow) >= SWALLOW_COOLDOWN):
                     swallow_count += 1
                     last_swallow = now
                     if fired_level > 0:
-                        print("  >>> RECOVERY - alert cleared", flush=True)
+                        print("  >>> RECOVERY — alert cleared", flush=True)
                     fired_level = 0
                     print(f"  >>> SWALLOW (p={latest_probs['swallow']:.2f}, "
                           f"count={swallow_count})", flush=True)
@@ -989,6 +1000,7 @@ def inference_loop():
                 if int(now) % 10 == 0:
                     print(f"[classify] err: {e}", flush=True)
 
+        # --- 3. Alert ladder ---
         for i, (thresh_s, buzz_n) in enumerate(ALERTS):
             level = i + 1
             if idle >= thresh_s and fired_level < level:
@@ -1007,11 +1019,13 @@ def inference_loop():
                     fire_sos_call()
                 break
 
+        # --- 3.5. Revert matrix to idle after heart display ---
         if heart_until > 0 and now >= heart_until and fired_level == 0:
             heart_until = 0.0
             try: Bridge.call("matrix_show", 0)
             except Exception: pass
 
+        # --- 4. Publish state ---
         if len(window) > 0:
             s = window[-1]
             update_state(
@@ -1025,6 +1039,7 @@ def inference_loop():
                 ratio         = s["ratio"],
             )
 
+        # --- 5. Pace the loop ---
         next_t += period
         delay = next_t - time.monotonic()
         if delay > 0:
